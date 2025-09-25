@@ -1,14 +1,16 @@
 import asyncio
 from datetime import datetime, timezone
-from typing import Dict, List, Literal
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import httpx
 import numpy as np
 from fastapi import HTTPException
 from loguru import logger
+from supabase import AsyncClient
 
 from phosphobot.am.act import ACT, ACTSpawnConfig
 from phosphobot.am.gr00t import Gr00tN1, Gr00tSpawnConfig
+from phosphobot.am.pi05 import Pi05, Pi05SpawnConfig
 from phosphobot.camera import AllCameras
 from phosphobot.control_signal import AIControlSignal
 from phosphobot.hardware.base import BaseManipulator
@@ -18,14 +20,18 @@ from phosphobot.utils import get_tokens
 
 
 class CustomAIControlSignal(AIControlSignal):
-    def __init__(self):
+    _status: Literal["stopped", "running", "paused", "waiting"]
+    _last_status_update: Optional[
+        Literal["stopped", "running", "paused", "waiting"]
+    ] = None
+    _supabase_client: Optional[AsyncClient] = None
+
+    def __init__(self) -> None:
         super().__init__()
-        self._supabase_client = None
-        self._last_status_update = None
 
     def _update_supabase(
-        self, started_at: datetime | None = None, ended_at: datetime | None = None
-    ):
+        self, started_at: Optional[datetime] = None, ended_at: Optional[datetime] = None
+    ) -> None:
         # schedule the real work in the running loop
         if self._status == self._last_status_update:
             return
@@ -33,12 +39,12 @@ class CustomAIControlSignal(AIControlSignal):
         loop.create_task(self._update_supabase_async(started_at, ended_at))
 
     async def _update_supabase_async(
-        self, started_at: datetime | None = None, ended_at: datetime | None = None
-    ):
-        if not self._supabase_client:
+        self, started_at: Optional[datetime] = None, ended_at: Optional[datetime] = None
+    ) -> None:
+        if self._supabase_client is None:
             self._supabase_client = await get_client()
 
-        payload = {"status": self._status}
+        payload: Dict[str, Any] = {"status": self._status}
         if started_at is not None:
             payload["started_at"] = started_at.isoformat()
         if ended_at is not None:
@@ -54,29 +60,30 @@ class CustomAIControlSignal(AIControlSignal):
             self._last_status_update = self._status
         except Exception as e:
             logger.warning(f"Error updating Supabase: {e}")
+        return None
 
-    def new_id(self):
+    def new_id(self) -> None:
         super().new_id()
 
-    def start(self):
+    def start(self) -> None:
         with self._lock:
             self._is_in_loop = True
             self._status = "waiting"
             self._update_supabase()
 
-    def set_running(self):
+    def set_running(self) -> None:
         with self._lock:
             self._is_in_loop = True
             self._status = "running"
             self._update_supabase(started_at=datetime.now(timezone.utc))
 
-    def stop(self):
+    def stop(self) -> None:
         with self._lock:
             self._is_in_loop = False
             self._status = "stopped"
             self._update_supabase(ended_at=datetime.now(timezone.utc))
 
-    def is_in_loop(self):
+    def is_in_loop(self) -> bool:
         with self._lock:
             return self._is_in_loop
 
@@ -85,7 +92,7 @@ class CustomAIControlSignal(AIControlSignal):
         return self._status
 
     @status.setter
-    def status(self, value: Literal["stopped", "running", "paused", "waiting"]):
+    def status(self, value: Literal["stopped", "running", "paused", "waiting"]) -> None:
         if value == "stopped":
             self.stop()
         elif value == "running":
@@ -106,12 +113,17 @@ async def setup_ai_control(
     robots: List[BaseManipulator],
     all_cameras: AllCameras,
     ai_control_signal_id: str,
-    model_type: Literal["gr00t", "ACT", "ACT_BBOX"],
+    model_type: Literal["gr00t", "ACT", "ACT_BBOX", "pi0.5"],
     model_id: str = "PLB/GR00T-N1-lego-pickup-mono-2",
-    cameras_keys_mapping: dict[str, int] | None = None,
+    cameras_keys_mapping: Optional[dict[str, int]] = None,
     init_connected_robots: bool = True,
     verify_cameras: bool = True,
-) -> tuple[Gr00tN1 | ACT, Gr00tSpawnConfig | ACTSpawnConfig, ServerInfoResponse]:
+    checkpoint: Optional[int] = None,
+) -> Tuple[
+    Gr00tN1 | ACT | Pi05,
+    Gr00tSpawnConfig | ACTSpawnConfig | Pi05SpawnConfig,
+    ServerInfoResponse,
+]:
     """
     Setup the AI control loop by spawning the inference server and returning the model.
     This function is called when the user clicks on the "Start AI Control" button in the UI.
@@ -132,10 +144,11 @@ async def setup_ai_control(
             detail="Session expired. Please log in again.",
         )
 
-    model_types: Dict[str, type[ACT | Gr00tN1]] = {
+    model_types: Dict[str, type[ACT | Gr00tN1 | Pi05]] = {
         "gr00t": Gr00tN1,
         "ACT": ACT,
         "ACT_BBOX": ACT,
+        "pi0.5": Pi05,
     }
 
     try:
@@ -153,7 +166,7 @@ async def setup_ai_control(
             detail=f"Model verification failed for {model_type}: {e}",
         )
 
-    def sanitize(o):
+    def sanitize(o: Any) -> object:
         if isinstance(o, float):
             return 0.0 if (np.isnan(o) or np.isinf(o)) else o
         if isinstance(o, dict):
@@ -175,8 +188,8 @@ async def setup_ai_control(
             url=f"{tokens.MODAL_API_URL}/spawn",
             json={
                 "model_id": model_id,
+                "checkpoint": checkpoint,
                 "model_type": model_type,
-                "timeout": 15 * 60,
                 "model_specifics": clean,
             },
             headers={
@@ -204,7 +217,7 @@ async def setup_ai_control(
 
     server_info = ServerInfoResponse.model_validate(response.json())
 
-    connects_through_tcp = ["gr00t"]
+    connects_through_tcp = ["gr00t", "pi0.5"]
 
     if model_type in connects_through_tcp:
         server_url = server_info.tcp_socket[0]
@@ -228,6 +241,6 @@ async def setup_ai_control(
                 detail="No robot connected. Exiting AI control loop.",
             )
         for robot in robots:
-            await robot.move_to_initial_position()
+            await robot.move_to_initial_position(open_gripper=True)
 
     return model, model_spawn_config, server_info

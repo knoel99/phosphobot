@@ -52,6 +52,7 @@ import {
   AlertCircle,
   ArrowUpFromLine,
   ChevronRight,
+  //Columns3,
   Download,
   ExternalLink,
   Eye,
@@ -61,7 +62,7 @@ import {
   MoreVertical,
   Plus,
   Repeat,
-  // Shuffle,
+  Shuffle,
   Split,
   Trash2,
   Wrench,
@@ -290,7 +291,7 @@ const MergeDialog: React.FC<MergeDialogProps> = ({
   );
 };
 
-export default function FileBrowser() {
+export function BrowsePage() {
   const params = useParams();
   const [searchParams] = useSearchParams();
   const path = params.path || searchParams.get("path") || "";
@@ -461,6 +462,14 @@ export default function FileBrowser() {
     setOpenSplitModel(true);
   };
 
+  // const handleColumnCheck = async () => {
+  //   if (selectedItems.length !== 1) {
+  //     toast.error("Please select exactly 1 dataset to check columns");
+  //     return;
+  //   }
+  //   setOpenDeleteModal(true);
+  // };
+
   const mergeMultipleDatasets = async (
     newDatasetName: string,
     imageKeyMappings?: Record<string, string>,
@@ -468,30 +477,22 @@ export default function FileBrowser() {
     setLoading(true);
     console.log("Merging datasets:", selectedItems);
 
-    try {
-      const response = await fetchWithBaseUrl(`/dataset/merge`, "POST", {
-        first_dataset: selectedItems[0],
-        second_dataset: selectedItems[1],
-        new_dataset_name: newDatasetName,
-        image_key_mappings: imageKeyMappings,
-      });
+    const data = await fetchWithBaseUrl(`/dataset/merge`, "POST", {
+      first_dataset: selectedItems[0],
+      second_dataset: selectedItems[1],
+      new_dataset_name: newDatasetName,
+      image_key_mappings: imageKeyMappings,
+    });
 
-      if (response.status !== "ok") {
-        toast.error("Failed to merge datasets");
-      } else {
-        toast.success("Episode merged successfully");
-        mutate();
-        redirect(path);
-      }
+    if (data) {
+      toast.success("Episode merged successfully");
+      mutate();
+      redirect(path);
       console.log("Merged datasets:", selectedItems);
-    } catch (error) {
-      toast.error("Failed to merge datasets");
-      console.error("Merge error:", error);
-    } finally {
-      // This ensures loading is set to false after the operation completes
-      setLoading(false);
-      setMergeModalOpen(false);
     }
+
+    setLoading(false);
+    setMergeModalOpen(false);
   };
 
   const handleRepairDataset = async () => {
@@ -598,7 +599,7 @@ export default function FileBrowser() {
 
         <Button variant="outline" onClick={() => setOpenDownloadModal(true)}>
           <Plus className="mr-2 h-4 w-4" />
-          Add dataset from hub 🤗
+          Add dataset from Hub 🤗
         </Button>
       </div>
       {data.tokenError && (
@@ -700,11 +701,7 @@ export default function FileBrowser() {
                                 rel="noopener noreferrer"
                                 className="inline-flex"
                               >
-                                <Button
-                                  variant={"outline"}
-                                  className="cursor-pointer"
-                                  size="sm"
-                                >
+                                <Button variant={"outline"} size="sm">
                                   <Eye className="mr-2 h-4 w-4" />
                                   Preview
                                 </Button>
@@ -848,11 +845,19 @@ export default function FileBrowser() {
                 {/* <Button
                   className="mb-4"
                   variant="outline"
+                  onClick={() => handleColumnCheck()}
+                >
+                  <Columns3 className="mr-2 h-4 w-3" />
+                  Check Selected Columns
+                </Button> */}
+                <Button
+                  className="mb-4"
+                  variant="outline"
                   onClick={() => setOpenShuffleModal(true)}
                 >
                   <Shuffle className="mr-2 h-4 w-3" />
                   Shuffle Selected Datasets
-                </Button> */}
+                </Button>
               </>
             )}
             <Button
@@ -1006,8 +1011,8 @@ export default function FileBrowser() {
       <Modal
         open={openDownloadModal}
         onOpenChange={setOpenDownloadModal}
-        title="Download dataset"
-        description="Enter the Hugging Face dataset name to download: should be hf_name/dataset_name"
+        title="Download dataset from the Hugging Face Hub 🤗"
+        description="The dataset should be available as public on the Hugging Face Hub."
         confirmLabel={loading ? "Downloading..." : "Download"}
         isLoading={loading}
         onConfirm={async () => {
@@ -1042,7 +1047,7 @@ export default function FileBrowser() {
                 setHFDatasetName(value);
               }
             }}
-            placeholder="Enter the name of the dataset to download"
+            placeholder="hf_username/dataset_name"
             className="w-full"
           />
         </div>
@@ -1077,7 +1082,7 @@ export default function FileBrowser() {
         open={openShuffleModal}
         onOpenChange={setOpenShuffleModal}
         title="Shuffle Datasets"
-        description="This will shuffle the selected datasets."
+        description="This will shuffle the selected datasets in place (no copy)."
         confirmLabel={loading ? "Shuffling..." : "Shuffle"}
         isLoading={loading}
         onConfirm={async () => {

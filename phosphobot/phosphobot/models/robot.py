@@ -1,16 +1,21 @@
 import asyncio
 import json
 from abc import ABC, abstractmethod
-from typing import List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import numpy as np
 from loguru import logger
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from serial.tools.list_ports_common import ListPortInfo
 
 from phosphobot.utils import get_home_app_path
 
 DEFAULT_FILE_ENCODING = "utf-8"
+
+
+class Temperature(BaseModel):
+    current: Optional[float]
+    max: Optional[float]
 
 
 class RobotConfigStatus(BaseModel):
@@ -20,7 +25,8 @@ class RobotConfigStatus(BaseModel):
 
     name: str
     robot_type: Literal["manipulator", "mobile", "other"] = "manipulator"
-    device_name: str | None
+    device_name: Optional[str]
+    temperature: Optional[List[Temperature]] = None
 
 
 class BaseRobot(ABC):
@@ -30,15 +36,15 @@ class BaseRobot(ABC):
 
     @abstractmethod
     def set_motors_positions(
-        self, positions: np.ndarray, enable_gripper: bool = False
+        self, q_target_rad: np.ndarray, enable_gripper: bool = False
     ) -> None:
         """
-        Set the motor positions of the robot
+        Set the motor positions of the robot in radians.
         """
         raise NotImplementedError
 
     @abstractmethod
-    def get_info_for_dataset(self):
+    def get_info_for_dataset(self) -> Any:
         """
         Generate information about the robot useful for the dataset.
         Return a BaseRobotInfo object. (see models.dataset.BaseRobotInfo)
@@ -47,7 +53,9 @@ class BaseRobot(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def get_observation(self) -> tuple[np.ndarray, np.ndarray]:
+    def get_observation(
+        self, source: Literal["sim", "robot"], do_forward: bool = False
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Get the observation of the robot.
         This method should return the observation of the robot.
@@ -101,8 +109,8 @@ class BaseRobot(ABC):
     async def move_robot_absolute(
         self,
         target_position: np.ndarray,  # cartesian np.array
-        target_orientation_rad: np.ndarray | None,  # rad np.array
-        **kwargs,
+        target_orientation_rad: Optional[np.ndarray],  # rad np.array
+        **kwargs: Dict[str, Any],
     ) -> None:
         """
         Move the robot to the target position and orientation.
@@ -111,7 +119,9 @@ class BaseRobot(ABC):
         raise NotImplementedError
 
     @classmethod
-    def from_port(cls, port: ListPortInfo, **kwargs) -> Optional["BaseRobot"]:
+    def from_port(
+        cls, port: ListPortInfo, **kwargs: Dict[str, Any]
+    ) -> Optional["BaseRobot"]:
         """
         Return the robot class from the port information.
         """
@@ -146,7 +156,7 @@ class BaseRobot(ABC):
         """
         raise NotImplementedError
 
-    def move_to_sleep_sync(self):
+    def move_to_sleep_sync(self) -> None:
         asyncio.run(self.move_to_sleep())
 
 
@@ -185,8 +195,39 @@ class BaseRobotConfig(BaseModel):
     pid_gains: List[BaseRobotPIDGains] = Field(default_factory=list)
 
     # Torque value to consider that an object is gripped
-    gripping_threshold: int = 0
-    non_gripping_threshold: int = 0  # noise
+    gripping_threshold: int = Field(
+        default=80,
+        gt=0,
+        description="Torque threshold to consider an object gripped. This will block the gripper position and prevent it from moving further.",
+    )
+    non_gripping_threshold: int = Field(
+        default=10,
+        gt=0,
+        description="Torque threshold to consider an object not gripped. This will allow the gripper to move freely.",
+    )
+
+    @model_validator(mode="after")
+    def validate_servos_arrays(self) -> "BaseRobotConfig":
+        """Validate that servos_offsets and servos_calibration_position have same length
+        and different values at each position"""
+        if len(self.servos_offsets) != len(self.servos_calibration_position):
+            raise ValueError(
+                f"servos_offsets (length {len(self.servos_offsets)}) and "
+                f"servos_calibration_position (length {len(self.servos_calibration_position)}) "
+                f"must have the same length"
+            )
+
+        # Check that corresponding elements are different
+        for i, (offset, cal_pos) in enumerate(
+            zip(self.servos_offsets, self.servos_calibration_position)
+        ):
+            if offset == cal_pos:
+                raise ValueError(
+                    f"servos_offsets[{i}] ({offset}) must be different from "
+                    f"servos_calibration_position[{i}] ({cal_pos})"
+                )
+
+        return self
 
     @classmethod
     def from_json(cls, filepath: str) -> Union["BaseRobotConfig", None]:
@@ -248,3 +289,16 @@ class BaseRobotConfig(BaseModel):
         logger.info(f"Saving configuration to {filepath}")
         self.to_json(filepath)
         return filepath
+
+
+class RobotConfigResponse(BaseModel):
+    """
+    Response model for robot configuration.
+    """
+
+    robot_id: int
+    name: str
+    config: Optional[BaseRobotConfig]
+    gripper_joint_index: Optional[int] = None
+    servo_ids: List[int] = Field(default_factory=lambda: list(range(1, 7)))
+    resolution: int = 4096

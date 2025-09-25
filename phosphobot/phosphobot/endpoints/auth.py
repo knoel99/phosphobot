@@ -2,6 +2,7 @@ import time
 
 from fastapi import APIRouter, HTTPException
 from loguru import logger
+from supabase import AuthInvalidCredentialsError, AuthWeakPasswordError
 
 from phosphobot.models import (
     AuthResponse,
@@ -11,6 +12,7 @@ from phosphobot.models import (
     ResetPasswordRequest,
     SessionReponse,
     StatusResponse,
+    VerifyEmailCodeRequest,
 )
 from phosphobot.posthog import add_email_to_posthog
 from phosphobot.sentry import add_email_to_sentry
@@ -52,12 +54,25 @@ async def signup(
     """
     Sign up a new user.
     """
+    from phosphobot.configs import config
+    from phosphobot.utils import get_local_ip
+
+    delete_session()
     client = await get_client()
 
     try:
+        redirect_url = f"http://{get_local_ip()}:{config.PORT}/"
         response = await client.auth.sign_up(
-            {"email": credentials.email, "password": credentials.password}
+            {
+                "email": credentials.email,
+                "password": credentials.password,
+                "options": {
+                    # Redirect URL: Local IP and port for email confirmation
+                    "email_redirect_to": redirect_url
+                },
+            }
         )
+
         if response.user is not None:
             if response.session is not None:
                 if response.user.email is None:
@@ -96,6 +111,9 @@ async def signup(
     except HTTPException as http_exc:
         # Re-raise HTTP exceptions to maintain the status code and detail
         raise http_exc
+    except (AuthInvalidCredentialsError, AuthWeakPasswordError) as e:
+        # Handle specific authentication errors
+        raise HTTPException(status_code=400, detail=f"Invalid credentials: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Signup failed: {e}")
 
@@ -115,11 +133,11 @@ async def signin(
         )
         if response.session is None:
             # If no session is returned, it means the user is not authenticated
-            raise HTTPException(status_code=401, detail="Invalid email or password.")
+            raise HTTPException(status_code=401, detail="Session not found.")
         if response.user is None:
-            raise HTTPException(status_code=401, detail="Invalid email or password.")
+            raise HTTPException(status_code=401, detail="User not found.")
         if response.user.email is None:
-            raise HTTPException(status_code=400, detail="Email is required for signin.")
+            raise HTTPException(status_code=400, detail="User not found.")
         # If signin succeeds, response.session will be present
         session = Session(
             user_id=response.user.id,
@@ -208,7 +226,57 @@ async def confirm_email(request: ConfirmRequest) -> SessionReponse | HTTPExcepti
         )
 
 
-@router.get("/auth/check_auth", response_model=AuthResponse)
+@router.post("/auth/verify-email-token", response_model=SessionReponse)
+async def verify_email_token(
+    query: VerifyEmailCodeRequest,
+) -> SessionReponse | HTTPException:
+    """
+    Verify the email confirmation code sent to the user.
+    """
+    client = await get_client()
+
+    try:
+        response = await client.auth.verify_otp(
+            {
+                "email": query.email,
+                "token": query.token,
+                "type": "email",
+            }
+        )
+        if (
+            response.user is None
+            or response.session is None
+            or response.user.email is None
+        ):
+            raise HTTPException(
+                status_code=400, detail="Invalid or expired email verification token."
+            )
+
+        session = Session(
+            user_id=response.user.id,
+            user_email=response.user.email,
+            email_confirmed=response.user.email_confirmed_at is not None,
+            access_token=response.session.access_token,
+            refresh_token=response.session.refresh_token,
+            expires_at=int(time.time()) + response.session.expires_in,
+        )
+        save_session(session)
+        add_email_to_posthog(response.user.email)
+        add_email_to_sentry(response.user.email)
+        is_pro_user = await check_pro_user(response.user.id)
+        return SessionReponse(
+            message="Email verification successful",
+            session=session,
+            is_pro_user=is_pro_user,
+        )
+    except HTTPException as http_exc:
+        # Re-raise HTTP exceptions to maintain the status code and detail
+        raise http_exc
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Email verification failed: {e}")
+
+
+@router.get("/auth/check-auth", response_model=AuthResponse)
 async def is_authenticated() -> AuthResponse:
     """
     Check if the user is authenticated by validating the session with Supabase.
@@ -227,8 +295,11 @@ async def is_authenticated() -> AuthResponse:
         if session.user.email is None:
             # If the user email is not set, treat as unauthenticated
             return AuthResponse(authenticated=False)
+        # Check if the user is a Pro user
+        is_pro_user = await check_pro_user(session.user.id)
         return AuthResponse(
             authenticated=True,
+            is_pro_user=is_pro_user,
             session=Session(
                 user_id=session.user.id,
                 user_email=session.user.email,

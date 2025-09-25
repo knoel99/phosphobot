@@ -38,7 +38,7 @@ export function HuggingFaceKeyInput() {
       token,
     }).then((response) => {
       setIsLoading(false);
-      if (response.status == "success") {
+      if (response.status == "ok") {
         toast.success("Hugging Face token saved successfully");
         setIsSuccess(true);
         // auto hide success message after 5 seconds
@@ -103,11 +103,7 @@ export function HuggingFaceKeyInput() {
               disabled={isLoading}
               autoComplete="off"
             />
-            <Button
-              type="submit"
-              disabled={isLoading}
-              className="cursor-pointer"
-            >
+            <Button type="submit" disabled={isLoading}>
               {isLoading ? (
                 <span className="flex items-center">
                   <LoaderCircle className="animate-spin size-5" />

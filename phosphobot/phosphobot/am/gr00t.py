@@ -8,10 +8,25 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Callable, Dict, Literal, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Tuple,
+    Union,
+)
 
-import cv2
+if TYPE_CHECKING:
+    # We only need BaseManipulator for type checking
+    # This prevents loading pybullet in modal
+    from phosphobot.hardware.base import BaseManipulator
+
 import numpy as np
+import pandas as pd
 import zmq
 from fastapi import HTTPException
 from huggingface_hub import HfApi, snapshot_download
@@ -29,7 +44,7 @@ from phosphobot.am.base import (
 )
 from phosphobot.camera import AllCameras
 from phosphobot.control_signal import AIControlSignal
-from phosphobot.hardware.base import BaseManipulator
+from phosphobot.models import ModelConfigurationResponse
 from phosphobot.utils import background_task_log_exceptions, get_hf_token
 
 # Code from: https://github.com/NVIDIA/Isaac-GR00T/blob/main/gr00t/eval/service.py#L111
@@ -67,7 +82,7 @@ class BaseInferenceServer:
     Can add custom endpoints by calling `register_endpoint`.
     """
 
-    def __init__(self, host: str = "*", port: int = 5555):
+    def __init__(self, host: str = "*", port: int = 5555) -> None:
         self.running = True
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.REP)
@@ -78,7 +93,7 @@ class BaseInferenceServer:
         self.register_endpoint("ping", self._handle_ping, requires_input=False)
         self.register_endpoint("kill", self._kill_server, requires_input=False)
 
-    def _kill_server(self):
+    def _kill_server(self) -> None:
         """
         Kill the server.
         """
@@ -92,7 +107,7 @@ class BaseInferenceServer:
 
     def register_endpoint(
         self, name: str, handler: Callable, requires_input: bool = True
-    ):
+    ) -> None:
         """
         Register a new endpoint to the server.
 
@@ -184,7 +199,7 @@ class RobotInferenceServer(BaseInferenceServer):
     Server with three endpoints for real robot policies
     """
 
-    def __init__(self, model: BasePolicy, host: str = "*", port: int = 5555):
+    def __init__(self, model: BasePolicy, host: str = "*", port: int = 5555) -> None:
         super().__init__(host, port)
         self.register_endpoint("get_action", model.get_action)
         self.register_endpoint(
@@ -192,7 +207,7 @@ class RobotInferenceServer(BaseInferenceServer):
         )
 
     @staticmethod
-    def start_server(policy: BasePolicy, port: int):
+    def start_server(policy: BasePolicy, port: int) -> None:
         server = RobotInferenceServer(policy, port=port)
         server.run()
 
@@ -200,15 +215,16 @@ class RobotInferenceServer(BaseInferenceServer):
 class BaseInferenceClient:
     def __init__(
         self, host: str = "localhost", port: int = 5555, timeout_ms: int = 15000
-    ):
+    ) -> None:
         self.context = zmq.Context()
+
         self.host = host
         self.port = port
         self.timeout_ms = timeout_ms
         self.version = 2
         self._init_socket()
 
-    def _init_socket(self):
+    def _init_socket(self) -> None:
         """Initialize or reinitialize the socket with current settings"""
         self.socket = self.context.socket(zmq.REQ)
         self.socket.connect(f"tcp://{self.host}:{self.port}")
@@ -221,14 +237,14 @@ class BaseInferenceClient:
             self._init_socket()  # Recreate socket for next attempt
             return False
 
-    def kill_server(self):
+    def kill_server(self) -> None:
         """
         Kill the server.
         """
         self.call_endpoint("kill", requires_input=False)
 
     def call_endpoint(
-        self, endpoint: str, data: dict | None = None, requires_input: bool = True
+        self, endpoint: str, data: Optional[Dict] = None, requires_input: bool = True
     ) -> dict:
         """
         Call an endpoint on the server.
@@ -261,7 +277,7 @@ class BaseInferenceClient:
             # legacy: the handler's own dict
             return resp
 
-    def __del__(self):
+    def __del__(self) -> None:
         """Cleanup resources on destruction"""
         self.socket.close()
         self.context.term()
@@ -300,7 +316,7 @@ class ComponentStatistics(BaseModel):
         extra = "allow"
 
     @model_validator(mode="before")
-    def collect_active_components(self):
+    def collect_active_components(self) -> "ComponentStatistics":
         """
         Collect names and values of all fields containing valid Stats before validation.
         Ensures extra fields are included in active_components.
@@ -404,7 +420,7 @@ class HuggingFaceModelConfig(BaseModel):
     # This will store the found embodiment config
     embodiment: EmbodimentConfig
     # This will store the original field name
-    embodiment_field_name: str | None = None
+    embodiment_field_name: Optional[str] = None
 
     class Config:
         extra = "allow"
@@ -444,13 +460,23 @@ class HuggingFaceModelConfig(BaseModel):
         return data
 
 
+class HuggingFaceAugmentedConfig(HuggingFaceModelConfig):
+    """
+    This model extends HuggingFaceModelConfig to include additional fields
+    for augmented models, such as available checkpoints.
+    """
+
+    checkpoints: list[str] = Field(
+        default_factory=list, description="List of available checkpoints for the model."
+    )
+
+
 class Gr00tSpawnConfig(BaseModel):
     video_keys: list[str]
     state_keys: list[str]
     action_keys: list[str]
     embodiment_tag: str
-    unit: Literal["degrees", "rad"]
-    hf_model_config: HuggingFaceModelConfig
+    hf_model_config: HuggingFaceAugmentedConfig
 
     # not good enough
     # class Config:
@@ -475,10 +501,10 @@ class Gr00tN1(ActionModel):
         ],  # These values are read from the values in experiment_cfg/metadata.json
         server_url: str = "localhost",
         server_port: int = 5555,
-        **kwargs,
-    ):
+        **kwargs: Any,
+    ) -> None:
         super().__init__(server_url, server_port)
-        self.client = ExternalRobotInferenceClient(server_url, server_port)
+        self.client = ExternalRobotInferenceClient(host=server_url, port=server_port)
         self.action_keys = action_keys
 
     def sample_actions(self, inputs: dict) -> np.ndarray:
@@ -529,7 +555,7 @@ class Gr00tN1(ActionModel):
         return concatenated_actions
 
     @classmethod
-    def fetch_config(cls, model_id: str) -> HuggingFaceModelConfig:
+    def fetch_config(cls, model_id: str) -> HuggingFaceAugmentedConfig:
         """
         Fetch the model config from Hugging Face Hub.
         If the model is not found on Hugging Face Hub, it will be loaded from the given path.
@@ -551,6 +577,16 @@ class Gr00tN1(ActionModel):
                 config_content = f.read()
             # Parse the file
             hf_model_config = HuggingFaceModelConfig.model_validate_json(config_content)
+            # Fetch the available revisions
+            branches = []
+            refs = api.list_repo_refs(model_id)
+            for branch in refs.branches:
+                branches.append(branch.name)
+
+            hf_augmented_config = HuggingFaceAugmentedConfig(
+                **hf_model_config.model_dump(), checkpoints=branches
+            )
+
         except Exception as e:
             logger.info(
                 f"Couldn't load model {model_id} from Hugging Face Hub. Trying from local path."
@@ -565,8 +601,11 @@ class Gr00tN1(ActionModel):
                 config_content = f.read()
             # Parse the file
             hf_model_config = HuggingFaceModelConfig.model_validate_json(config_content)
+            hf_augmented_config = HuggingFaceAugmentedConfig(
+                **hf_model_config.model_dump(), checkpoints=["main"]
+            )
 
-        return hf_model_config
+        return hf_augmented_config
 
     @classmethod
     def fetch_spawn_config(cls, model_id: str) -> Gr00tSpawnConfig:
@@ -584,22 +623,16 @@ class Gr00tN1(ActionModel):
             for key in hf_model_config.embodiment.statistics.action.component_names
         ]
 
-        # Determine angle unit based on state statistics
-        max_values = hf_model_config.embodiment.statistics.state.get_max_value()
-        use_degrees = max_values > 3.2
-        angle_unit: Literal["degrees", "rad"] = "degrees" if use_degrees else "rad"
-
         return Gr00tSpawnConfig(
             video_keys=video_keys,
             state_keys=state_keys,
             action_keys=action_keys,
             embodiment_tag=hf_model_config.embodiment.embodiment_tag,
-            unit=angle_unit,
             hf_model_config=hf_model_config,
         )
 
     @classmethod
-    def fetch_and_get_video_keys(cls, model_id: str) -> list[str]:
+    def fetch_and_get_configuration(cls, model_id: str) -> ModelConfigurationResponse:
         """
         Fetch the model config and get the video keys.
         """
@@ -607,15 +640,18 @@ class Gr00tN1(ActionModel):
         video_keys = [
             "video." + key for key in hf_model_config.embodiment.modalities.video.keys()
         ]
-        return video_keys
+        return ModelConfigurationResponse(
+            video_keys=video_keys,
+            checkpoints=hf_model_config.checkpoints,
+        )
 
     @classmethod
     def fetch_and_verify_config(
         cls,
         model_id: str,
         all_cameras: AllCameras,
-        robots: list[BaseManipulator],
-        cameras_keys_mapping: Dict[str, int] | None = None,
+        robots: list["BaseManipulator"],
+        cameras_keys_mapping: Optional[Dict[str, int]] = None,
         verify_cameras: bool = True,
     ) -> Gr00tSpawnConfig:
         """
@@ -669,17 +705,11 @@ class Gr00tN1(ActionModel):
                 detail=f"Model has {number_of_robots} robots but {len(robots)} robots are connected.",
             )
 
-        # Determine angle unit based on state statistics
-        max_values = hf_model_config.embodiment.statistics.state.get_max_value()
-        use_degrees = max_values > 3.2
-        angle_unit: Literal["degrees", "rad"] = "degrees" if use_degrees else "rad"
-
         return Gr00tSpawnConfig(
             video_keys=video_keys,
             state_keys=state_keys,
             action_keys=action_keys,
             embodiment_tag=hf_model_config.embodiment.embodiment_tag,
-            unit=angle_unit,
             hf_model_config=hf_model_config,
         )
 
@@ -687,15 +717,18 @@ class Gr00tN1(ActionModel):
     async def control_loop(
         self,
         control_signal: AIControlSignal,
-        robots: list[BaseManipulator],
+        robots: List["BaseManipulator"],
         model_spawn_config: Gr00tSpawnConfig,
         all_cameras: AllCameras,
-        prompt: str | None = None,
+        prompt: Optional[str] = None,
         fps: int = 30,
         speed: float = 1.0,
-        cameras_keys_mapping: Dict[str, int] | None = None,
+        cameras_keys_mapping: Optional[Dict[str, int]] = None,
+        unit: Literal["degrees", "rad", "other"] = "rad",
+        min_angle: Optional[float] = None,
+        max_angle: Optional[float] = None,
         **kwargs: Any,
-    ):
+    ) -> None:
         """
         AI control loop that runs in the background and sends actions to the robot.
         It uses the model to get the actions based on the current state of the robot and the cameras.
@@ -703,10 +736,11 @@ class Gr00tN1(ActionModel):
         The loop runs at the specified fps and speed.
         """
 
+        import cv2
+
         nb_iter = 0
         config = model_spawn_config.hf_model_config
-
-        db_state_updated = False
+        signal_marked_as_started = False
 
         while control_signal.is_in_loop():
             logger.debug(
@@ -774,13 +808,19 @@ class Gr00tN1(ActionModel):
                 raise Exception("No robot connected. Exiting AI control loop.")
 
             # Concatenate all robot states
-            state = robots[0].read_joints_position(unit="rad")
+            state = robots[0].read_joints_position(
+                unit=unit, max_value=max_angle, min_value=min_angle
+            )
             for robot in robots[1:]:
                 state = np.concatenate(
-                    (state, robot.read_joints_position(unit="rad")), axis=0
+                    (
+                        state,
+                        robot.read_joints_position(
+                            unit=unit, max_value=max_angle, min_value=min_angle
+                        ),
+                    ),
+                    axis=0,
                 )
-            if model_spawn_config.unit == "degrees":
-                state = np.deg2rad(state)
 
             inputs = {
                 **image_inputs,
@@ -807,34 +847,91 @@ class Gr00tN1(ActionModel):
                 control_signal.stop()
                 break
 
-            if not db_state_updated:
+            if not signal_marked_as_started:
                 control_signal.set_running()
-                db_state_updated = True
-                # Small delay to let the UI update
-                await asyncio.sleep(1)
+                signal_marked_as_started = True
 
-            # Early stop
-            if not control_signal.is_in_loop():
-                break
-
+            nb_actions_too_large = 0
             for action in actions:
+                # Early stop
+                if not control_signal.is_in_loop():
+                    break
                 # Send the new joint position to the robot
                 action_list = action.tolist()
                 for robot_index in range(len(robots)):
-                    # If the action are all -pi in rad or -180 in degrees, skip
-                    if all(
-                        np.isclose(
-                            action_list[robot_index * 6 : robot_index * 6 + 6],
-                            -np.pi if model_spawn_config.unit == "rad" else -180,
+                    target_position = action_list[robot_index * 6 : robot_index * 6 + 6]
+
+                    # If the distance between the current and target position is too high, skip the action
+                    current_position = robots[robot_index].read_joints_position(
+                        unit=unit,
+                        max_value=max_angle,
+                        min_value=min_angle,
+                        source="sim",
+                    )
+                    max_transition_angles: np.ndarray
+                    if unit == "degrees":
+                        # The last joint is the gripper, which can open/close
+                        max_transition_angles = np.array([90.0] * 5 + [180.0])
+                        current_to_target_diff = np.abs(
+                            (target_position - current_position + 180) % 360 - 180
                         )
+
+                    elif unit == "rad":
+                        # The last joint is the gripper, which can open/close
+                        max_transition_angles = np.array([np.pi / 2] * 5 + [np.pi])
+                        current_to_target_diff = np.abs(
+                            (target_position - current_position + np.pi) % (2 * np.pi)
+                            - np.pi
+                        )
+                    elif (
+                        unit == "other"
+                        and max_angle is not None
+                        and min_angle is not None
                     ):
-                        logger.warning("All predicted actions are -pi. Skipping.")
-                        continue
+                        # The last joint is the gripper, which can open/close
+                        max_transition_angle = (max_angle - min_angle) / 2
+                        max_transition_angles = np.array(
+                            [max_transition_angle] * 5 + [max_angle - min_angle]
+                        )
+                        current_to_target_diff = np.abs(
+                            (target_position - current_position + max_angle)
+                            % (max_angle - min_angle)
+                            - max_transition_angle
+                        )
+                    else:
+                        raise ValueError(f"Unknown unit: {unit}")
+
+                    if np.any(current_to_target_diff > max_transition_angles):
+                        largest_diff = np.max(current_to_target_diff)
+                        largest_diff_index = np.argmax(current_to_target_diff)
+                        error_message = (
+                            f"Skipping action for robot {robot_index} because the to joint position {largest_diff_index} difference is too large: {largest_diff} > {max_transition_angles[largest_diff_index]} in units {unit}"
+                            + f"\nCurrent position: {current_position}"
+                            + f"\nTarget position: {target_position}\n"
+                            + "Possible reasons for this error:"
+                            + "\n1. Make sure you selected the *right angle unit* in the control page (angle, degrees, other)."
+                            + "\n2. Inspect your dataset joints positions to ensure they are within the expected range."
+                            + "\n3. There was an issue in the model output, please check the model training and data quality."
+                        )
+                        if nb_actions_too_large <= 20:
+                            logger.warning(error_message)
+                            nb_actions_too_large += 1
+                            continue
+                        else:
+                            control_signal.stop()
+                            raise Exception(error_message)
+                    else:
+                        logger.debug(
+                            f"Writing joint position to robot {robot_index}: {target_position}"
+                        )
 
                     robots[robot_index].write_joint_positions(
-                        angles=action_list[robot_index * 6 : robot_index * 6 + 6],
-                        unit=model_spawn_config.unit,
+                        angles=target_position,
+                        unit=unit,
+                        max_value=max_angle,
+                        min_value=min_angle,
                     )
+                    nb_actions_too_large = 0
 
                 # Wait fps time
                 elapsed_time = time.perf_counter() - start_time
@@ -851,7 +948,97 @@ class Gr00tTrainerConfig(BaseTrainerConfig):
     training_params: TrainingParamsGr00T
 
 
-def generate_modality_json(data_dir) -> tuple[int, int]:
+def check_for_nans_null_in_value(value: Union[list, tuple, pd.DataFrame]) -> bool:
+    """
+    Check if a value contains NaN/null, including nested lists
+    """
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            if check_for_nans_null_in_value(item):
+                return True
+    else:
+        if pd.isna(value).any():
+            return True
+        if pd.isnull(value).any():
+            return True
+
+    return False
+
+
+def check_parquet_files(folder_path: Path) -> None:
+    """
+    Check all parquet files in a folder for NaN/null values in the action/observation column
+
+    Raise an error if any NaN/null values in the action/observation column.
+    """
+    folder_path = Path(folder_path)
+
+    if not folder_path.exists():
+        raise FileNotFoundError(f"Folder '{folder_path}' does not exist.")
+
+    # Find all parquet files
+    parquet_files = list(folder_path.glob("*.parquet"))
+
+    if not parquet_files:
+        raise FileNotFoundError(f"No parquet files found in '{folder_path}'")
+
+    print(f"Found {len(parquet_files)} parquet file(s) to check:")
+    print("-" * 50)
+
+    total_issues = 0
+
+    for file_path in parquet_files:
+        try:
+            # Read the parquet file
+            df = pd.read_parquet(file_path)
+
+            # Check if action column exists
+            if "action" not in df.columns:
+                raise ValueError(
+                    f"File '{file_path.name}' does not contain 'action' column."
+                )
+            if "observation.state" not in df.columns:
+                raise ValueError(
+                    f"File '{file_path.name}' does not contain 'observation.state' column."
+                )
+
+            # Check for issues in the action column
+            issues_found = 0
+            problematic_rows = []
+
+            for idx, value in enumerate(df["action"]):
+                if check_for_nans_null_in_value(value):
+                    issues_found += 1
+                    problematic_rows.append(idx)
+
+            for idx, value in enumerate(df["observation.state"]):
+                if check_for_nans_null_in_value(value):
+                    issues_found += 1
+                    problematic_rows.append(idx)
+
+            if issues_found > 0:
+                print(
+                    f"❌ {file_path.name}: Found {issues_found} rows with NaN/null in action column"
+                )
+                print(
+                    f"   Problematic rows: {problematic_rows[:10]}{'...' if len(problematic_rows) > 10 else ''}"
+                )
+                total_issues += issues_found
+            else:
+                print(f"✅ {file_path.name}: No NaN/null values found in action column")
+
+        except Exception as e:
+            print(f"❌ {file_path.name}: Error reading file - {str(e)}")
+
+    print("-" * 50)
+    print(f"Total issues found across all files: {total_issues}")
+    if total_issues > 0:
+        raise ValueError(
+            f"Found {total_issues} NaN/null values in action/observation columns across all files. Please fix the data before re-training."
+        )
+
+
+def generate_modality_json(data_dir: Path) -> Tuple[int, int]:
     # Load the metadata file to get image keys
     with open(data_dir / "meta" / "info.json", "r") as f:
         metadata = json.load(f)
@@ -901,105 +1088,6 @@ def generate_modality_json(data_dir) -> tuple[int, int]:
     return number_of_robots, number_of_cameras
 
 
-async def run_gr00t_training(
-    data_dir,
-    output_dir,
-    batch_size,
-    epochs,
-    number_of_robots,
-    number_of_cameras,
-    learning_rate,
-    wandb_enabled: bool,
-    validation_data_dir=None,
-    timeout_seconds: int | None = None,
-    gr00t_repo_path: str = ".",
-):
-    cmd = [
-        "python",
-        f"{gr00t_repo_path}/scripts/gr00t_finetune.py",
-        "--dataset-path",
-        str(data_dir),
-    ]
-
-    if validation_data_dir is not None:
-        logger.info(f"Using validation dataset from {validation_data_dir}")
-        cmd.extend(["--validation-dataset-path", str(validation_data_dir)])
-    else:
-        logger.info("No validation dataset provided. No validation will be done.")
-
-    # Add remaining arguments
-    cmd.extend(
-        [
-            # Only 1 GPU for now
-            # Open an issue for multi-GPU support
-            "--num-gpus",
-            "1",
-            "--output-dir",
-            str(output_dir),
-            "--batch-size",
-            str(batch_size),
-            "--num-epochs",
-            str(epochs),
-            "--save-steps",
-            "10000",
-            "--num-arms",
-            str(number_of_robots),
-            "--num-cams",
-            str(number_of_cameras),
-            "--learning_rate",
-            str(learning_rate),
-            "--report_to",
-            "wandb" if wandb_enabled else "tensorboard",
-            "--video_backend",
-            "torchvision_av",
-        ]
-    )
-
-    logger.info(f"Starting training with command: {' '.join(cmd)}")
-
-    process = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-        # 512 KB buffer size, default is 64 but seems to be too small
-        limit=512 * 1024,
-    )
-
-    output_lines = []
-
-    async def read_output():
-        assert process.stdout is not None
-        async for line in process.stdout:
-            stripped_line = line.decode().strip()
-            print(stripped_line)
-            output_lines.append(stripped_line)
-
-    try:
-        if timeout_seconds is None:
-            # No timeout
-            await read_output()
-        else:
-            # Timeout
-            await asyncio.wait_for(read_output(), timeout=timeout_seconds)
-    except asyncio.TimeoutError:
-        process.kill()
-        await process.wait()
-        logger.error(f"Training process timed out after {timeout_seconds} seconds.")
-        raise TimeoutError(
-            f"Training process exceeded timeout of {timeout_seconds} seconds. Please consider lowering the number of epochs and/or batch size."
-        )
-
-    await process.wait()
-
-    if process.returncode != 0:
-        error_output = "\n".join(output_lines[-10:])
-        error_msg = f"Training process failed with exit code {process.returncode}:\n{error_output}"
-        logger.error(error_msg)
-        raise RuntimeError(error_msg)
-
-    return output_lines
-
-
 class Gr00tTrainer(BaseTrainer):
     """
     Trainer for the Gr00t model.
@@ -1009,7 +1097,12 @@ class Gr00tTrainer(BaseTrainer):
     def __init__(self, config: Gr00tTrainerConfig):
         self.config = config
 
-    def train(self, timeout_seconds: int | None = None) -> None:
+    def train(
+        self,
+        timeout_seconds: Optional[int] = None,
+        private_mode: bool = False,
+        hf_token: Optional[str] = None,
+    ) -> None:
         """
         You can pass a timeout in seconds to the training process.
         If the training process exceeds this time, it will be
@@ -1028,13 +1121,15 @@ class Gr00tTrainer(BaseTrainer):
 
         if self.config.model_name is not None:
             # We check if the user has write access to the model-id
-            hf_token = os.getenv("HF_TOKEN")
+            hf_token = hf_token or os.getenv("HF_TOKEN")
             if hf_token is None:
                 raise ValueError(
                     "HF_TOKEN environment variable is not set. Please set it to your Hugging Face token."
                 )
             if not HuggingFaceTokenValidator().has_write_access(
-                hf_token=hf_token, hf_model_name=self.config.model_name
+                hf_token=hf_token,
+                hf_model_name=self.config.model_name,
+                private=private_mode,
             ):
                 raise ValueError(
                     f"The provided HF token does not have write access to {self.config.model_name}"
@@ -1050,7 +1145,7 @@ class Gr00tTrainer(BaseTrainer):
                     repo_type="dataset",
                     revision=selected_branch,
                     local_dir=str(data_dir),
-                    token=os.getenv("HF_TOKEN"),
+                    token=hf_token,
                 )
                 DATASET_PATH = Path(dataset_path_as_str)
                 logger.info(
@@ -1066,12 +1161,15 @@ class Gr00tTrainer(BaseTrainer):
                         f"Failed to download dataset {self.config.dataset_name} after {max_retries} attempts, is Hugging Face down ? : {e}"
                     )
 
-        resized_successful, _ = resize_dataset(
+        # Check the dataset for null/nan values in action/observation columns
+        check_parquet_files(DATASET_PATH / "data" / "chunk-000")
+
+        resized_successful, _, resize_details = resize_dataset(
             dataset_root_path=DATASET_PATH, resize_to=(224, 224)
         )
         if not resized_successful:
             raise RuntimeError(
-                f"Resizing dataset {self.config.dataset_name} to 224x224 failed: {resized_successful}"
+                f"Resizing dataset {self.config.dataset_name} to 224x224 failed: {resize_details}"
             )
         logger.info(f"Resized dataset {self.config.dataset_name} to 224x224")
 
@@ -1079,7 +1177,7 @@ class Gr00tTrainer(BaseTrainer):
         logger.info("Generating modality.json file")
         number_of_robots, number_of_cameras = generate_modality_json(data_dir)
 
-        val_data_dir: Path | None = None
+        val_data_dir: Optional[Path] = None
         if self.config.training_params.validation_dataset_name is not None:
             if self.config.training_params.validation_data_dir is not None:
                 val_data_dir = Path(self.config.training_params.validation_data_dir)
@@ -1094,8 +1192,8 @@ class Gr00tTrainer(BaseTrainer):
                         repo_id=self.config.training_params.validation_dataset_name,
                         repo_type="dataset",
                         revision=selected_branch,
-                        local_dir=str(val_data_dir),
-                        token=os.getenv("HF_TOKEN"),
+                        local_dir=(val_data_dir),
+                        token=hf_token,
                     )
                     VAL_DATASET_PATH = Path(dataset_path_val_str)
                     logger.info(
@@ -1111,12 +1209,12 @@ class Gr00tTrainer(BaseTrainer):
                             f"Failed to download dataset {self.config.training_params.validation_dataset_name} after {max_retries} attempts, is Hugging Face down ? : {e}"
                         )
 
-            resized_successful, _ = resize_dataset(
+            resized_successful, _, resize_details = resize_dataset(
                 dataset_root_path=VAL_DATASET_PATH, resize_to=(224, 224)
             )
             if not resized_successful:
                 raise RuntimeError(
-                    f"Resizing dataset {self.config.training_params.validation_dataset_name} to 224x224 failed: {resized_successful}"
+                    f"Resizing dataset {self.config.training_params.validation_dataset_name} to 224x224 failed: {resize_details}"
                 )
             logger.info(
                 f"Resized dataset {self.config.training_params.validation_dataset_name} to 224x224"
@@ -1129,35 +1227,14 @@ class Gr00tTrainer(BaseTrainer):
             # We set the validation data dir to None to avoid passing it to the training script
             val_data_dir = None
 
-        # Find the total number of frames in the dataset in meta / info.json
-        with open(data_dir / "meta" / "info.json", "r") as f:
-            info = json.load(f)
-            total_frames = info["total_frames"]
-
-        steps = (
-            total_frames
-            * self.config.training_params.epochs
-            // self.config.training_params.batch_size
-            + 1
-        )
-
-        logger.info(
-            f"Will train for {self.config.training_params.epochs} epochs, which is {steps} steps"
-        )
-
         asyncio.run(
-            run_gr00t_training(
+            self._call_training_script(
                 data_dir=data_dir,
                 output_dir=output_dir,
-                batch_size=self.config.training_params.batch_size,
-                epochs=self.config.training_params.epochs,
+                validation_data_dir=val_data_dir,
                 number_of_robots=number_of_robots,
                 number_of_cameras=number_of_cameras,
-                learning_rate=self.config.training_params.learning_rate,
-                wandb_enabled=self.config.wandb_api_key is not None,
-                validation_data_dir=val_data_dir,
                 timeout_seconds=timeout_seconds,
-                gr00t_repo_path=self.config.training_params.path_to_gr00t_repo,
             )
         )
         logger.info("Training finished")
@@ -1166,13 +1243,13 @@ class Gr00tTrainer(BaseTrainer):
             logger.info(f"Uploading model to Hugging Face as {self.config.model_name}")
 
             # Upload using huggingface_hub
-            api = HfApi(token=os.getenv("HF_TOKEN"))
+            api = HfApi(token=hf_token)
             files_directory = output_dir
 
             api.create_repo(
                 repo_id=self.config.model_name,
                 repo_type="model",
-                private=False,
+                private=private_mode,
                 exist_ok=True,
             )
 
@@ -1204,12 +1281,45 @@ class Gr00tTrainer(BaseTrainer):
                             repo_id=self.config.model_name,
                         )
 
+            # Also upload checkpoint directories if they exist, named as "checkpoint-<number>"
+            for item in files_directory.glob("checkpoint-*"):
+                if item.is_dir():
+                    # Upload the entire directory structure
+                    for sub_item in item.glob("**/*"):
+                        if sub_item.is_file():
+                            # Get the relative path to maintain structure
+                            rel_path = sub_item.relative_to(item)
+
+                            logger.info(f"Uploading file: {rel_path}")
+                            # Parse the checkpoint number as an int
+                            try:
+                                # Should be 100, 400, etc.
+                                checkpoint_number = int(item.name.split("-")[-1])
+                            except ValueError:
+                                # Can also be "last" or similar
+                                logger.debug(
+                                    f"Skipping upload for {rel_path} as it does not have a valid checkpoint number"
+                                )
+                                continue
+                            api.create_branch(
+                                repo_type="model",
+                                branch=str(checkpoint_number),
+                                exist_ok=True,
+                                repo_id=self.config.model_name,
+                            )
+                            api.upload_file(
+                                repo_type="model",
+                                revision=str(checkpoint_number),
+                                path_or_fileobj=str(sub_item.resolve()),
+                                path_in_repo=str(rel_path),
+                                repo_id=self.config.model_name,
+                            )
+
             # Upload README last
             readme = generate_readme(
                 model_type="gr00t",
                 dataset_repo_id=self.config.dataset_name,
-                epochs=self.config.training_params.epochs,
-                batch_size=self.config.training_params.batch_size,
+                training_params=self.config.training_params,
                 return_readme_as_bytes=True,
             )
 
@@ -1223,12 +1333,110 @@ class Gr00tTrainer(BaseTrainer):
             # Get the model URL
             huggingface_model_url = f"https://huggingface.co/{self.config.model_name}"
             logger.info(f"Model successfully uploaded to {huggingface_model_url}")
-
-            logger.info("Model successfully uploaded to Hugging Face")
+        else:
             logger.info(
-                f"Find your trained model on Hugging Face: {huggingface_model_url}"
+                "Skipping upload to Hugging Face. Provide a model-id to enable automatic upload to Hugging Face"
             )
 
+    async def _call_training_script(
+        self,
+        data_dir: Path,
+        output_dir: Path,
+        validation_data_dir: Optional[Path],
+        number_of_robots: int,
+        number_of_cameras: int,
+        timeout_seconds: Optional[int] = None,
+        gr00t_repo_path: str = ".",
+    ) -> List[str]:
+        training_params = self.config.training_params
+        wandb_enabled = self.config.wandb_api_key is not None
+
+        cmd = [
+            "python",
+            f"{gr00t_repo_path}/scripts/gr00t_finetune.py",
+            "--dataset-path",
+            str(data_dir),
+        ]
+
+        if validation_data_dir is not None:
+            logger.info(f"Using validation dataset from {validation_data_dir}")
+            cmd.extend(["--validation-dataset-path", str(validation_data_dir)])
         else:
-            logger.info("Skipping upload to Hugging Face")
-            logger.info("Provide a model-id to enable automatic upload to Hugging Face")
+            logger.info("No validation dataset provided. No validation will be done.")
+
+        # Add remaining arguments
+        cmd.extend(
+            [
+                # Only 1 GPU for now
+                # Open an issue for multi-GPU support
+                "--num-gpus",
+                "1",
+                "--output-dir",
+                str(output_dir),
+                "--num-arms",
+                str(number_of_robots),
+                "--num-cams",
+                str(number_of_cameras),
+                "--report_to",
+                "wandb" if wandb_enabled else "tensorboard",
+                "--video_backend",
+                "torchvision_av",
+            ]
+        )
+
+        # Adds all extra parameters from the training_params
+        training_params_dict = training_params.model_dump(
+            by_alias=True,
+            exclude_none=True,
+            exclude={
+                "data_dir": True,
+                "output_dir": True,
+                "validation_data_dir": True,
+            },
+        )
+        for key, value in training_params_dict.items():
+            cmd.extend([f"--{key}", str(value)])
+
+        logger.info(f"Starting training with command: {' '.join(cmd)}")
+
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            # 512 KB buffer size, default is 64 but seems to be too small
+            limit=512 * 1024,
+        )
+
+        output_lines = []
+
+        async def read_output() -> None:
+            assert process.stdout is not None
+            async for line in process.stdout:
+                stripped_line = line.decode().strip()
+                print(stripped_line)
+                output_lines.append(stripped_line)
+
+        try:
+            if timeout_seconds is None:
+                # No timeout
+                await read_output()
+            else:
+                # Timeout
+                await asyncio.wait_for(read_output(), timeout=timeout_seconds)
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+            logger.error(f"Training process timed out after {timeout_seconds} seconds.")
+            raise TimeoutError(
+                f"Training process exceeded timeout of {timeout_seconds} seconds. Please consider lowering the number of epochs and/or batch size."
+            )
+
+        await process.wait()
+
+        if process.returncode != 0:
+            error_output = "\n".join(output_lines[-10:])
+            error_msg = f"Training process failed with exit code {process.returncode}:\n{error_output}"
+            logger.error(error_msg)
+            raise RuntimeError(error_msg)
+
+        return output_lines

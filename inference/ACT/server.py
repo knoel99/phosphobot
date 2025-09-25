@@ -34,7 +34,7 @@ from fastapi import FastAPI, HTTPException
 from huggingface_hub import snapshot_download
 from huggingface_hub.errors import RepositoryNotFoundError
 from huggingface_hub.utils._validators import HFValidationError
-from lerobot.common.policies.act.modeling_act import ACTPolicy
+from lerobot.policies.act.modeling_act import ACTPolicy
 from pydantic import BaseModel
 
 app = FastAPI()
@@ -257,7 +257,7 @@ async def inference(request: InferenceRequest) -> str | None:
         )
 
         # Encode response using json_numpy
-        response = json_numpy.dumps(actions[0])
+        response = json_numpy.dumps(actions)
         return response
 
     except Exception as e:

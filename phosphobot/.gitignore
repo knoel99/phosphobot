@@ -24,5 +24,7 @@ main
 
 # Secrets
 secrets.toml
-resources/tokens.toml
 resources/tokens.prod.toml
+resources/tokens.dev.toml
+
+.claude

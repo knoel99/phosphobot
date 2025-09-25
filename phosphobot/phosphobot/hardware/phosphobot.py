@@ -1,11 +1,12 @@
 import asyncio
+from typing import Any, List, Literal, Optional, Tuple
+
 import httpx
 import numpy as np
-
-from phosphobot.hardware.base import BaseRobot
 from loguru import logger
 
-from phosphobot.models.robot import RobotConfigStatus
+from phosphobot.hardware.base import BaseRobot
+from phosphobot.models import BaseRobotConfig, RobotConfigStatus
 
 
 class RemotePhosphobot(BaseRobot):
@@ -14,8 +15,11 @@ class RemotePhosphobot(BaseRobot):
     """
 
     name = "phosphobot"
+    _config: Optional[BaseRobotConfig] = None
 
-    def __init__(self, ip: str, port: int, robot_id: int, **kwargs):
+    def __init__(
+        self, ip: str, port: int, robot_id: int, **kwargs: dict[str, Any]
+    ) -> None:
         """
         Initialize connectio to phosphobot.
 
@@ -31,8 +35,8 @@ class RemotePhosphobot(BaseRobot):
         self.current_position = np.zeros(3)
         self.current_orientation = np.zeros(3)  # [roll, pitch, yaw]
         self.robot_id = robot_id
-        self.initial_position: np.ndarray | None = None
-        self.initial_orientation_rad: np.ndarray | None = None
+        self.initial_position: Optional[np.ndarray] = None
+        self.initial_orientation_rad: Optional[np.ndarray] = None
         self.device_name = f"{self.ip}:{self.port}"
 
     @property
@@ -88,7 +92,9 @@ class RemotePhosphobot(BaseRobot):
             logger.warning(f"Failed to disconnect from remote phosphobot: {e}")
             raise Exception(f"Disconnection failed: {e}")
 
-    def get_observation(self) -> tuple[np.ndarray, np.ndarray]:
+    def get_observation(
+        self, source: Literal["sim", "robot"], do_forward: bool = False
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Get the observation of the robot.
 
@@ -101,7 +107,9 @@ class RemotePhosphobot(BaseRobot):
             "/end-effector/read", params={"robot_id": self.robot_id}
         ).json()
         joints = self.client.post(
-            "/joints/read", json={"unit": "rad"}, params={"robot_id": self.robot_id}
+            "/joints/read",
+            json={"unit": "rad", "source": source},
+            params={"robot_id": self.robot_id},
         ).json()
         state = np.array(
             [
@@ -119,19 +127,23 @@ class RemotePhosphobot(BaseRobot):
         return state, joints_position
 
     def set_motors_positions(
-        self, positions: np.ndarray, enable_gripper: bool = False
+        self, q_target_rad: np.ndarray, enable_gripper: bool = False
     ) -> None:
         """
         Set the motor positions of the robot.
         """
 
+        if not enable_gripper:
+            # Exclude gripper joint if not enabled
+            q_target_rad = q_target_rad[:-1]
+
         self.client.post(
             "/joints/write",
-            json={"angles": positions.tolist(), "unit": "rad"},
+            json={"angles": q_target_rad.tolist(), "unit": "rad"},
             params={"robot_id": self.robot_id},
         )
 
-    def get_info_for_dataset(self):
+    def get_info_for_dataset(self) -> dict:
         """
         Not implemented
         """
@@ -140,8 +152,8 @@ class RemotePhosphobot(BaseRobot):
     async def move_robot_absolute(
         self,
         target_position: np.ndarray,
-        target_orientation_rad: np.ndarray | None,
-        **kwargs,
+        target_orientation_rad: Optional[np.ndarray],
+        **kwargs: Any,
     ) -> None:
         """
         Move the robot to the target position and orientation asynchronously.
@@ -181,7 +193,7 @@ class RemotePhosphobot(BaseRobot):
             raise Exception(f"Move failed: {response.text}")
 
     async def move_robot_relative(
-        self, target_position: np.ndarray, target_orientation_rad: np.ndarray | None
+        self, target_position: np.ndarray, target_orientation_rad: Optional[np.ndarray]
     ) -> None:
         # Replace None values in target_position and target_orientation_rad with 0
 
@@ -217,7 +229,7 @@ class RemotePhosphobot(BaseRobot):
 
     def forward_kinematics(
         self, sync_robot_pos: bool = False
-    ) -> tuple[np.ndarray, np.ndarray]:
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Get the end effector position and orientation of the robot.
         """
@@ -291,7 +303,7 @@ class RemotePhosphobot(BaseRobot):
             return
         await self.async_client.post("/move/sleep", params={"robot_id": self.robot_id})
 
-    def enable_torque(self):
+    def enable_torque(self) -> None:
         """
         Enable the torque of the robot.
         """
@@ -305,7 +317,7 @@ class RemotePhosphobot(BaseRobot):
             params={"robot_id": self.robot_id},
         )
 
-    def disable_torque(self):
+    def disable_torque(self) -> None:
         """
         Disable the torque of the robot.
         """
@@ -366,10 +378,10 @@ class RemotePhosphobot(BaseRobot):
 
     def write_joint_positions(
         self,
-        angles: list[float],
+        angles: List[float],
         unit: str = "rad",
-        joints_ids: list[int] | None = None,
-        **kwargs,
+        joints_ids: Optional[List[int]] = None,
+        **kwargs: Any,
     ) -> None:
         """
         Write joint positions to the robot.
@@ -389,7 +401,11 @@ class RemotePhosphobot(BaseRobot):
             params={"robot_id": self.robot_id},
         )
 
-    def read_joints_position(self, unit: str = "rad") -> np.ndarray:
+    def read_joints_position(
+        self,
+        unit: Literal["rad", "degrees", "motor_units"] = "rad",
+        source: Optional[Literal["sim", "robot"]] = None,
+    ) -> np.ndarray:
         """
         Read the current joint positions of the robot.
 
@@ -404,14 +420,14 @@ class RemotePhosphobot(BaseRobot):
 
         response = self.client.post(
             "/joints/read",
-            json={"unit": unit},
+            json={"unit": unit, "source": source},
             params={"robot_id": self.robot_id},
         )
         joints = response.json()
         return np.array(joints["angles"])
 
     @property
-    def actuated_joints(self) -> list[int]:
+    def actuated_joints(self) -> List[int]:
         """
         Get the list of actuated joints.
 
@@ -435,3 +451,71 @@ class RemotePhosphobot(BaseRobot):
         """
         # TODO: Implement this method to set PID gains for the motors
         pass
+
+    @property
+    def config(self) -> Optional[BaseRobotConfig]:
+        """
+        Get the configuration of the robot.
+
+        Returns:
+            BaseRobotConfig: Configuration of the robot
+        """
+        if self._config is not None:
+            return self._config
+
+        # Call the /robot/config endpoint to get the robot configuration
+        response = self.client.post(
+            "/robot/config",
+            params={"robot_id": self.robot_id},
+        )
+
+        config_response = response.json()
+        if config_response.get("config") is None:
+            logger.warning("Robot configuration is not set. Run the calibration first.")
+            return None
+        self._config = BaseRobotConfig.model_validate(config_response["config"])
+        self.GRIPPER_JOINT_INDEX = config_response.get("gripper_joint_index", -1)
+        self.SERVO_IDS = config_response.get("servo_ids", list(range(1, 7)))
+        self.RESOLUTION = config_response.get("resolution", 4096)
+        return self._config
+
+    def _rad_to_open_command(self, radians: float) -> float:
+        """
+        Convert radians to open command for the gripper.
+        """
+        if self.config is None:
+            raise ValueError(
+                "Robot configuration is not set. Run the calibration first."
+            )
+        open_position = self.config.servos_calibration_position[-1]
+        close_position = self.config.servos_offsets[-1]
+        open_command = (
+            self._radians_to_motor_units(
+                radians=radians, servo_id=self.GRIPPER_JOINT_INDEX
+            )
+            - close_position
+        ) / (open_position - close_position)
+        return np.clip(open_command, 0, 1)
+
+    def _radians_to_motor_units(self, radians: float, servo_id: int) -> int:
+        """
+        Convert a single q position from radians to motor discrete units (0 -> RESOLUTION)
+
+        Note: The result can exceed the resolution of the motor, in the case of a continuous rotation motor.
+        """
+        offset_id = self.SERVO_IDS.index(servo_id)
+        if self.config is None:
+            raise ValueError(
+                "Robot configuration is not set. Run the calibration first."
+            )
+
+        x = (
+            int(
+                radians
+                * self.config.servos_offsets_signs[offset_id]
+                * ((self.RESOLUTION - 1) / (2 * np.pi))
+            )
+            + self.config.servos_offsets[offset_id]
+        )
+
+        return int(x)

@@ -2,12 +2,19 @@
 PyBullet Simulation wrapper class
 """
 
+import io
 import os
 import subprocess
+import sys
+import threading
 import time
+from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 import pybullet as p
 from loguru import logger
+
+from phosphobot.types import SimulationMode
 
 sim = None
 
@@ -17,29 +24,40 @@ class PyBulletSimulation:
     A comprehensive wrapper class for PyBullet simulation environment.
     """
 
-    def __init__(self, sim_mode="headless"):
+    def __init__(
+        self,
+        sim_mode: SimulationMode = SimulationMode.headless,
+    ) -> None:
         """
         Initialize the PyBullet simulation environment.
 
         Args:
-            sim_mode (str): Simulation mode - "headless" or "gui"
+            sim_mode (SimulationMode): Simulation mode - "headless" or "gui"
         """
         self.sim_mode = sim_mode
         self.connected = False
-        self.robots = {}  # Store loaded robots
-        self.init_simulation()
+        self.robots: dict = {}  # Store loaded robots
+        self._running = False
+        self._step_thread: Optional[threading.Thread] = None
 
-    def init_simulation(self):
+        self._pending_steps = 0
+        self._lock = threading.Lock()
+
+        self.init_simulation()
+        self.start_stepping()
+
+    def init_simulation(self) -> None:
         """
         Initialize the pybullet simulation environment based on the configuration.
         """
-        if self.sim_mode == "headless":
+        if self.sim_mode == SimulationMode.headless:
             p.connect(p.DIRECT)
             p.setGravity(0, 0, -9.81)
+            p.setTimeStep(1.0 / 10)  # 10 Hz simulation
             self.connected = True
             logger.debug("Simulation: headless mode enabled")
 
-        elif self.sim_mode == "gui":
+        elif self.sim_mode == SimulationMode.gui:
             # Spin up a new process for the simulation
             absolute_path = os.path.abspath(
                 os.path.join(
@@ -47,14 +65,36 @@ class PyBulletSimulation:
                     "..",
                     "..",
                     "..",
-                    "..",
                     "simulation",
                     "pybullet",
                 )
             )
-            subprocess.Popen(
-                ["uv", "run", "--python", "3.8", "main.py"], cwd=absolute_path
+
+            def _stream_to_console(pipe: io.BufferedReader) -> None:
+                """Continuously read from *pipe* and write to stdout."""
+                try:
+                    with pipe:
+                        for line in iter(pipe.readline, b""):
+                            # decode bytes -> str and write to the console
+                            sys.stdout.write(
+                                "[gui sim] " + line.decode("utf-8", errors="replace")
+                            )
+                            sys.stdout.flush()
+                except Exception as exc:
+                    logger.warning(f"Error while reading child stdout: {exc}")
+
+            self._gui_proc = subprocess.Popen(
+                ["uv", "run", "--python", "3.8", "main.py"],
+                cwd=absolute_path,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,  # merge stderr into stdout
+                bufsize=0,
             )
+            t = threading.Thread(
+                target=_stream_to_console, args=(self._gui_proc.stdout,), daemon=True
+            )
+            t.start()
+
             # Wait for 1 second to allow the simulation to start
             time.sleep(1)
             p.connect(p.SHARED_MEMORY)
@@ -64,26 +104,94 @@ class PyBulletSimulation:
         else:
             raise ValueError("Invalid simulation mode")
 
-    def stop(self):
+        try:
+            import pybullet_data
+
+            data_path = pybullet_data.getDataPath()
+            p.setAdditionalSearchPath(data_path)
+            logger.debug(f"Added pybullet_data search path: {data_path}")
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.debug(f"Failed to set additional search path for pybullet_data: {e}")
+
+    def start_stepping(self) -> None:
+        if self._running:
+            logger.debug("Simulation stepping already running")
+            return
+
+        if not self.connected or not p.isConnected():
+            logger.warning("Simulation is not connected, cannot start stepping")
+            return
+
+        self._running = True
+
+        def _loop() -> None:
+            while self._running and self.connected and p.isConnected():
+                steps_to_do = 0
+                with self._lock:
+                    if self._pending_steps > 0:
+                        steps_to_do = self._pending_steps
+                        self._pending_steps = 0
+
+                if steps_to_do > 0:
+                    for _ in range(steps_to_do):
+                        p.stepSimulation()
+                else:
+                    time.sleep(0.01)  # avoid busy loop
+
+        self._step_thread = threading.Thread(target=_loop, daemon=True)
+        self._step_thread.start()
+        logger.info("Started background stepping thread with counter")
+
+    def stop_stepping(self) -> None:
+        if not self._running:
+            return
+        self._running = False
+        if self._step_thread is not None:
+            self._step_thread.join(timeout=1)
+            self._step_thread = None
+        logger.info("Stopped background stepping thread")
+
+    def step(self, steps: int = 60) -> None:
+        """
+        Increment the pending step counter (non-blocking).
+        """
+        if not self.connected or not p.isConnected():
+            logger.warning("Simulation is not connected, cannot enqueue step")
+            return
+
+        with self._lock:
+            self._pending_steps += steps
+
+    def stop(self) -> None:
         """
         Cleanup the simulation environment.
         """
+        self.stop_stepping()
         if self.connected and p.isConnected():
             p.disconnect()
             self.connected = False
             logger.info("Simulation disconnected")
 
         if self.sim_mode == "gui":
+            if hasattr(self, "_gui_proc") and self._gui_proc.poll() is None:
+                self._gui_proc.terminate()
+                try:
+                    self._gui_proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    self._gui_proc.kill()
             # Kill the simulation process: any instance of python 3.8
+            # A bit invasive. Can we do something better?
             subprocess.run(["pkill", "-f", "python3.8"])
 
-    def __del__(self):
+    def __del__(self) -> None:
         """
         Cleanup when object is destroyed.
         """
         self.stop()
 
-    def reset(self):
+    def reset(self) -> None:
         """
         Reset the simulation environment.
         """
@@ -95,21 +203,9 @@ class PyBulletSimulation:
         self.robots.clear()
         logger.info("Simulation reset")
 
-    def step(self, steps=960):
-        """
-        Step the simulation environment.
-
-        Args:
-            steps (int): Number of simulation steps to execute
-        """
-        if not self.connected or not p.isConnected():
-            logger.warning("Simulation is not connected, cannot step")
-            return
-
-        for _ in range(steps):
-            p.stepSimulation()
-
-    def set_joint_state(self, robot_id, joint_id: int, joint_position: float):
+    def set_joint_state(
+        self, robot_id: int, joint_id: int, joint_position: float
+    ) -> None:
         """
         Set the joint state of a robot in the simulation.
 
@@ -125,8 +221,12 @@ class PyBulletSimulation:
         p.resetJointState(robot_id, joint_id, joint_position)
 
     def inverse_dynamics(
-        self, robot_id, positions: list, velocities: list, accelerations: list
-    ):
+        self,
+        robot_id: int,
+        positions: List[float],
+        velocities: List[float],
+        accelerations: List[float],
+    ) -> List[float]:
         """
         Perform inverse dynamics to compute joint angles from end-effector pose.
 
@@ -153,32 +253,43 @@ class PyBulletSimulation:
     def load_urdf(
         self,
         urdf_path: str,
-        axis: list[float] | None = None,
-        axis_orientation: list[int] = [0, 0, 0, 1],
+        axis: Optional[List[float]] = None,
+        axis_orientation: Optional[List[int]] = None,
         use_fixed_base: bool = True,
-    ):
+        enable_self_collision: bool = False,
+    ) -> Tuple[int, int, List[int]]:
         """
         Load a URDF file into the simulation.
 
-        Args:
-            urdf_path (str): The path to the URDF file.
-            axis (list[float] | None): The axis of the robot.
-            axis_orientation (list[int]): The orientation of the robot.
-            use_fixed_base (bool): Whether to use a fixed base for the robot.
+        Args
+            urdf_path (str): Path to the URDF file
+            axis (list, optional): Base position of the robot in the simulation
+            axis_orientation (list, optional): Base orientation of the robot in the simulation
+            use_fixed_base (bool): Whether to use a fixed base for the robot
 
         Returns:
             tuple: (robot_id, num_joints, actuated_joints)
         """
+        if axis_orientation is None:
+            axis_orientation = [0, 0, 0, 1]
+
         if not self.connected or not p.isConnected():
             logger.warning("Simulation is not connected, cannot load URDF")
-            return None, 0, []
+            raise RuntimeError(
+                f"Can't load URDF {urdf_path} - simulation not connected."
+            )
+
+        if enable_self_collision:
+            flags = (p.URDF_MAINTAIN_LINK_ORDER and p.URDF_USE_SELF_COLLISION)
+        else:
+            flags = p.URDF_MAINTAIN_LINK_ORDER
 
         robot_id = p.loadURDF(
             urdf_path,
             basePosition=axis,
             baseOrientation=axis_orientation,
             useFixedBase=use_fixed_base,
-            flags=p.URDF_MAINTAIN_LINK_ORDER,
+            flags=flags,
         )
 
         num_joints = p.getNumJoints(robot_id)
@@ -189,6 +300,10 @@ class PyBulletSimulation:
             # Consider only revolute joints
             if joint_type in [p.JOINT_REVOLUTE]:
                 actuated_joints.append(i)
+            else:
+                logger.warning(
+                    f"Joint {i} is not revolute, type: {joint_type} - skipping"
+                )
 
         # Store robot info
         self.robots[robot_id] = {
@@ -199,7 +314,9 @@ class PyBulletSimulation:
 
         return robot_id, num_joints, actuated_joints
 
-    def set_joints_states(self, robot_id, joint_indices, target_positions):
+    def set_joints_states(
+        self, robot_id: int, joint_indices: List[int], target_positions: List[float]
+    ) -> None:
         """
         Set multiple joint states of a robot in the simulation.
 
@@ -219,7 +336,26 @@ class PyBulletSimulation:
             targetPositions=target_positions,
         )
 
-    def get_joint_state(self, robot_id, joint_index: int) -> list:
+    def get_joints_states(self, robot_id: int, joint_indices: List[int]) -> List[float]:
+        """
+        Get the states of multiple joints in the simulation.
+
+        Args:
+            robot_id (int): The ID of the robot in the simulation.
+            joint_indices (list[int]): The indices of the joints to get.
+
+        Returns:
+            list[float]: List of joint positions.
+        """
+        if not self.connected or not p.isConnected():
+            logger.warning("Simulation is not connected, cannot get joint states")
+            return []
+
+        joint_states = p.getJointStates(robot_id, joint_indices)
+        joint_positions = [state[0] for state in joint_states]
+        return joint_positions
+
+    def get_joint_state(self, robot_id: int, joint_index: int) -> List:
         """
         Get the state of a joint in the simulation.
 
@@ -228,7 +364,7 @@ class PyBulletSimulation:
             joint_index (int): The index of the joint to get.
 
         Returns:
-            list: pybullet list describing the joint state.
+            list: pybullet list describing the joint state.s
         """
         if not self.connected or not p.isConnected():
             logger.warning("Simulation is not connected, cannot get joint state")
@@ -239,18 +375,18 @@ class PyBulletSimulation:
 
     def inverse_kinematics(
         self,
-        robot_id,
+        robot_id: int,
         end_effector_link_index: int,
-        target_position,
-        target_orientation,
-        rest_poses: list,
-        joint_damping: list | None = None,
-        lower_limits: list | None = None,
-        upper_limits: list | None = None,
-        joint_ranges: list | None = None,
+        target_position: np.ndarray,
+        target_orientation: Optional[np.ndarray],
+        rest_poses: List,
+        joint_damping: Optional[List] = None,
+        lower_limits: Optional[List] = None,
+        upper_limits: Optional[List] = None,
+        joint_ranges: Optional[List] = None,
         max_num_iterations: int = 200,
         residual_threshold: float = 1e-6,
-    ) -> list:
+    ) -> List[float]:
         """
         Perform inverse kinematics to compute joint angles from end-effector pose.
 
@@ -306,7 +442,7 @@ class PyBulletSimulation:
         )
 
     def get_link_state(
-        self, robot_id, link_index: int, compute_forward_kinematics: bool = False
+        self, robot_id: int, link_index: int, compute_forward_kinematics: bool = False
     ) -> list:
         """
         Get the state of a link in the simulation.
@@ -328,7 +464,7 @@ class PyBulletSimulation:
         )
         return link_state
 
-    def get_joint_info(self, robot_id, joint_index: int) -> list:
+    def get_joint_info(self, robot_id: int, joint_index: int) -> List:
         """
         Get the information of a joint in the simulation.
 
@@ -347,8 +483,8 @@ class PyBulletSimulation:
         return joint_info
 
     def add_debug_text(
-        self, text: str, text_position, text_color_RGB: list, life_time: int = 3
-    ):
+        self, text: str, text_position: list, text_color_RGB: list, life_time: int = 3
+    ) -> None:
         """
         Add debug text to the simulation.
 
@@ -371,11 +507,11 @@ class PyBulletSimulation:
 
     def add_debug_points(
         self,
-        point_positions: list,
-        point_colors_RGB: list,
+        point_positions: List,
+        point_colors_RGB: List,
         point_size: int = 4,
         life_time: int = 3,
-    ):
+    ) -> None:
         """
         Add debug points to the simulation.
 
@@ -398,12 +534,12 @@ class PyBulletSimulation:
 
     def add_debug_lines(
         self,
-        line_from_XYZ: list,
-        line_to_XYZ: list,
-        line_color_RGB: list,
+        line_from_XYZ: List,
+        line_to_XYZ: List,
+        line_color_RGB: List,
         line_width: int = 4,
         life_time: int = 3,
-    ):
+    ) -> None:
         """
         Add debug lines to the simulation.
 
@@ -426,7 +562,7 @@ class PyBulletSimulation:
             lifeTime=life_time,
         )
 
-    def get_robot_info(self, robot_id):
+    def get_robot_info(self, robot_id: int) -> dict:
         """
         Get information about a loaded robot.
 
@@ -438,7 +574,7 @@ class PyBulletSimulation:
         """
         return self.robots.get(robot_id, {})
 
-    def get_all_robots(self):
+    def get_all_robots(self) -> dict:
         """
         Get all loaded robots.
 
@@ -447,7 +583,7 @@ class PyBulletSimulation:
         """
         return self.robots
 
-    def is_connected(self):
+    def is_connected(self) -> bool:
         """
         Check if the simulation is connected.
 
@@ -456,20 +592,23 @@ class PyBulletSimulation:
         """
         return self.connected and p.isConnected()
 
-    def set_gravity(self, gravity_vector: list = [0, 0, -9.81]):
+    def set_gravity(self, gravity_vector: Optional[List[float]] = None) -> None:
         """
         Set the gravity vector for the simulation.
 
         Args:
             gravity_vector (list): The gravity vector [x, y, z]
         """
+        if gravity_vector is None:
+            gravity_vector = [0, 0, -9.81]
+
         if not self.connected or not p.isConnected():
             logger.warning("Simulation is not connected, cannot set gravity")
             return
 
         p.setGravity(*gravity_vector)
 
-    def get_dynamics_info(self, robot_id, link_index: int = -1):
+    def get_dynamics_info(self, robot_id: int, link_index: int = -1) -> List:
         """
         Get dynamics information for a robot body/link.
 
@@ -486,7 +625,9 @@ class PyBulletSimulation:
 
         return p.getDynamicsInfo(robot_id, link_index)
 
-    def change_dynamics(self, robot_id, link_index: int = -1, **kwargs):
+    def change_dynamics(
+        self, robot_id: int, link_index: int = -1, **kwargs: Dict[str, Any]
+    ) -> None:
         """
         Change dynamics properties of a robot body/link.
 

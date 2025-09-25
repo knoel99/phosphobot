@@ -2,7 +2,7 @@ import json
 import logging
 from collections import deque
 from dataclasses import dataclass
-from typing import Deque, Optional
+from typing import Any, Deque, Literal, Optional, Tuple
 
 import numpy as np
 import zmq
@@ -15,13 +15,13 @@ from phosphobot.models import RobotConfigStatus
 @dataclass
 class MovementCommand:
     position: np.ndarray
-    orientation: np.ndarray | None = None
+    orientation: Optional[np.ndarray] = None
 
 
 class LeKiwi(BaseMobileRobot):
     name = "lekiwi"
 
-    def __init__(self, ip: str, port: int, max_history_len: int = 100, **kwargs):
+    def __init__(self, ip: str, port: int, max_history_len: int = 100, **kwargs: Any):
         """
         Initialize the LeKiwi robot.
 
@@ -95,7 +95,9 @@ class LeKiwi(BaseMobileRobot):
             self.conn = None
             self.is_connected = False
 
-    def get_observation(self) -> tuple[np.ndarray, np.ndarray]:
+    def get_observation(
+        self, source: Literal["sim", "robot"], do_forward: bool = False
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Get the observation of the robot.
 
@@ -112,14 +114,14 @@ class LeKiwi(BaseMobileRobot):
         return state, joints_position
 
     def set_motors_positions(
-        self, positions: np.ndarray, enable_gripper: bool = False
+        self, q_target_rad: np.ndarray, enable_gripper: bool = False
     ) -> None:
         """
         Not implemented
         """
         pass
 
-    def get_info_for_dataset(self):
+    def get_info_for_dataset(self) -> dict:
         """
         Not implemented
         """
@@ -128,8 +130,8 @@ class LeKiwi(BaseMobileRobot):
     async def move_robot_absolute(
         self,
         target_position: np.ndarray,
-        target_orientation_rad: np.ndarray | None,
-        **kwargs,
+        target_orientation_rad: Optional[np.ndarray],
+        **kwargs: Any,
     ) -> None:
         """
         Move the robot to the target position and orientation asynchronously.
@@ -175,7 +177,7 @@ class LeKiwi(BaseMobileRobot):
         )
 
     @classmethod
-    def from_ip(cls, ip: str, port: int, **kwargs) -> Optional["LeKiwi"]:
+    def from_ip(cls, ip: str, port: int, **kwargs: Any) -> Optional["LeKiwi"]:
         """
         Create an instance from an IP and port
 

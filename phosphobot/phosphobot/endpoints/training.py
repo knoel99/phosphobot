@@ -2,23 +2,24 @@ import asyncio
 import os
 import platform
 import time
-from typing import cast
+from typing import AsyncGenerator, cast
 
 import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from fastapi.responses import PlainTextResponse, StreamingResponse
 from huggingface_hub import HfApi
 from loguru import logger
+from supabase_auth.types import Session as SupabaseSession
 
 from phosphobot.am.base import TrainingParamsGr00T, TrainingRequest
 from phosphobot.models import (
+    CancelTrainingRequest,
     CustomTrainingRequest,
     InfoModel,
     StartTrainingResponse,
-    CancelTrainingRequest,
     StatusResponse,
     SupabaseTrainingModel,
-    TrainingConfig,
+    TrainingsList,
 )
 from phosphobot.supabase import get_client, user_is_logged_in
 from phosphobot.utils import get_hf_token, get_home_app_path, get_tokens
@@ -26,35 +27,96 @@ from phosphobot.utils import get_hf_token, get_home_app_path, get_tokens
 router = APIRouter(tags=["training"])
 
 
-@router.post("/training/models/read", response_model=TrainingConfig)
+@router.post("/training/models/read", response_model=TrainingsList)
 async def get_models(
-    session=Depends(user_is_logged_in),
-) -> TrainingConfig:
-    """Get the list of models to be trained"""
+    session: SupabaseSession = Depends(user_is_logged_in),
+) -> TrainingsList:
+    """Get the list of models with aggregated AI control session metrics"""
     client = await get_client()
     user_id = session.user.id
 
-    model_list = await (
-        client.table("trainings")
-        .select("*")
-        .eq("user_id", user_id)
-        .order("requested_at", desc=True)
-        .limit(1000)
-        .execute()
-    )
+    # Run this SQL query to create the function in Supabase:
+    # -- Switch to the public schema
+    # SET search_path = public;
 
-    if not model_list.data or len(model_list.data) == 0:
-        return TrainingConfig(
-            models=[],
-        )
+    # DROP FUNCTION IF EXISTS public.get_models_with_metrics(uuid, integer);
 
-    # Convert the list of models to a TrainingConfig object
-    training_config = TrainingConfig(
-        models=[
-            SupabaseTrainingModel.model_validate(model) for model in model_list.data
-        ]
-    )
-    return training_config
+    # CREATE OR REPLACE FUNCTION public.get_models_with_metrics(p_user_id uuid, p_limit integer DEFAULT 1000)
+    # RETURNS TABLE (
+    # id               integer,
+    # status           text,
+    # user_id          uuid,
+    # dataset_name     text,
+    # model_name       text,
+    # requested_at     timestamp,
+    # terminated_at    timestamp,
+    # used_wandb       boolean,
+    # model_type       text,
+    # training_params  jsonb,
+    # session_count    bigint,
+    # success_rate     double precision
+    # )
+    # LANGUAGE sql
+    # SECURITY INVOKER
+    # SET search_path = 'public'
+    # AS $$
+    # WITH recent_trainings AS (
+    #     SELECT
+    #     id,
+    #     status,
+    #     user_id,
+    #     dataset_name,
+    #     model_name,
+    #     requested_at,
+    #     terminated_at,
+    #     used_wandb,
+    #     model_type,
+    #     training_params
+    #     FROM public.trainings
+    #     WHERE user_id = p_user_id
+    #     ORDER BY requested_at DESC
+    #     LIMIT p_limit
+    # ), stats AS (
+    #     SELECT
+    #     model_id,
+    #     COUNT(*)                          AS session_count,
+    #     SUM(CASE WHEN feedback IS NOT NULL THEN 1 ELSE 0 END) AS feedback_given,
+    #     SUM(CASE WHEN feedback = 'positive' THEN 1 ELSE 0 END) AS positive_count
+    #     FROM public.ai_control_sessions
+    #     WHERE user_id = p_user_id
+    #     GROUP BY model_id
+    # )
+    # SELECT
+    #     t.id,
+    #     t.status,
+    #     t.user_id,
+    #     t.dataset_name,
+    #     t.model_name,
+    #     t.requested_at,
+    #     t.terminated_at,
+    #     t.used_wandb,
+    #     t.model_type,
+    #     t.training_params,
+    #     COALESCE(s.session_count, 0)      AS session_count,
+    #     CASE
+    #     WHEN COALESCE(s.feedback_given, 0) = 0 THEN 0.0
+    #     ELSE s.positive_count::double precision / s.feedback_given
+    #     END                                AS success_rate
+    # FROM recent_trainings t
+    # LEFT JOIN stats s
+    #     ON t.model_name = s.model_id
+    # ORDER BY t.requested_at DESC;
+    # $$;
+
+    result = await client.rpc(
+        "get_models_with_metrics",
+        {"p_user_id": user_id, "p_limit": 1000},
+    ).execute()
+    trainings = result.data or []
+
+    # Validate and return
+    models = [SupabaseTrainingModel.model_validate(item) for item in trainings]
+    return TrainingsList(models=models)
 
 
 @router.post(
@@ -65,117 +127,130 @@ async def get_models(
 )
 async def start_training(
     request: TrainingRequest,
-    session=Depends(user_is_logged_in),
+    session: SupabaseSession = Depends(user_is_logged_in),
 ) -> StartTrainingResponse | HTTPException:
     """
     Trigger training for a gr00t or ACT model on the specified dataset.
 
-    This will upload a trained model to the Hugging Face Hub using the main branch of the specified dataset.
-
-    Before launching a training, please make sure that:
-    - Your dataset is uploaded to Hugging Face
-    - Your dataset is in the Le Robot format (>= v2.0)
-    - Your dataset has at least 10 episodes
-    - You are logged in to phosphobot
-
-    Pro usage:
-    - (You can add a wandb token in phosphobot to track your training)
+    This endpoint now relies on the TrainingRequest model for all data validation and preparation,
+    focusing solely on business logic and orchestration.
     """
-    logger.debug(f"Training request: {request}")
+    logger.debug(f"Validated and prepared training request: {request}")
+
+    # Business Logic: Validate user permissions for private training.
+    if request.private_mode:
+        from phosphobot.endpoints.auth import check_pro_user
+
+        is_pro = await check_pro_user(session.user.id)
+        if not is_pro:
+            raise HTTPException(
+                status_code=403,
+                detail="Private training is only available for PRO users.",
+            )
+        # We can also add a final check that the token is present, though the model should guarantee it.
+        if not request.user_hf_token:
+            raise HTTPException(
+                status_code=400,
+                detail="Private training requires a valid HF token in your settings.",
+            )
+
+    # Configuration & Environment Logic: Check for external tokens/configs.
     tokens = get_tokens()
     if not tokens.MODAL_API_URL:
         raise HTTPException(
             status_code=400,
-            detail="Modal API url not found. Please check your configuration.",
+            detail="Modal API URL not found. Server configuration is incomplete.",
         )
 
-    wandb_token_path = str(get_home_app_path()) + "/wandb.token"
+    wandb_token_path = str(get_home_app_path() / "wandb.token")
     if os.path.exists(wandb_token_path):
-        logger.debug("WandB token found. Will be used for the training.")
-        # If present, we add the wandb api key to the training request
+        logger.debug("WandB token found. Adding to the training request.")
         with open(wandb_token_path, "r") as f:
             request.wandb_api_key = f.read().strip()
 
-    # Check that the given dataset has enough episodes to train
-    api = HfApi(token=get_hf_token())
+    # Deep Validation Logic: Check dataset integrity beyond simple access.
+    hf_api = HfApi(token=request.user_hf_token or get_hf_token())
     try:
-        info_file_path = api.hf_hub_download(
+        info_file_path = hf_api.hf_hub_download(
             repo_id=request.dataset_name,
             repo_type="dataset",
             filename="meta/info.json",
-            force_download=True,
         )
         meta_folder_path = os.path.dirname(info_file_path)
         validated_info_model = InfoModel.from_json(meta_folder_path=meta_folder_path)
         if validated_info_model.total_episodes < 10:
             raise HTTPException(
                 status_code=400,
-                detail="The dataset has less than 10 episodes. Please record more episodes before training.",
+                detail="The dataset must have at least 10 episodes to be used for training.",
             )
-    except HTTPException as e:
-        raise e
     except Exception as e:
-        logger.warning(f"Error accessing dataset info: {e}")
+        logger.warning(
+            f"Error accessing dataset info for '{request.dataset_name}': {e}"
+        )
         raise HTTPException(
             status_code=404,
-            detail=f"Failed to download and parse meta/info.json.\n{e}",
+            detail=f"Failed to download or parse 'meta/info.json' from dataset '{request.dataset_name}'. Please ensure the dataset is valid. Error: {e}",
         )
-    # The check is only done for gr00t models
+
+    # Specific validation for gr00t models
     if request.model_type == "gr00t":
-        # We cast the training params to the correct type
         training_params = cast(TrainingParamsGr00T, request.training_params)
         if training_params.validation_dataset_name:
             try:
-                info_file_path = api.hf_hub_download(
+                hf_api.hf_hub_download(
                     repo_id=training_params.validation_dataset_name,
                     repo_type="dataset",
                     filename="meta/info.json",
-                    force_download=True,
                 )
-                meta_folder_path = os.path.dirname(info_file_path)
-                InfoModel.from_json(meta_folder_path=meta_folder_path)
             except Exception as e:
                 logger.warning(f"Error accessing validation dataset info: {e}")
                 raise HTTPException(
                     status_code=404,
-                    detail=f"Failed to download and parse validation meta/info.json.\n{e}",
+                    detail=f"Failed to access the validation dataset '{training_params.validation_dataset_name}'. Error: {e}",
                 )
 
-    # Send training request to modal API
+    # Orchestration: Send the prepared request to the training service.
     async with httpx.AsyncClient(timeout=30) as client:
-        response = await client.post(
-            f"{tokens.MODAL_API_URL}/train",
-            json=request.model_dump(),
-            headers={"Authorization": f"Bearer {session.access_token}"},
-        )
-
-        # We need the token on modal so we raise an error if the token is not right
-        if response.status_code == 401:
-            raise HTTPException(
-                status_code=401,
-                detail="Token expired. Please login again.",
+        try:
+            training_request_body = request.model_dump()
+            response = await client.post(
+                f"{tokens.MODAL_API_URL}/train",
+                json=training_request_body,
+                headers={"Authorization": f"Bearer {session.access_token}"},
             )
-        if response.status_code == 429:
-            # Too many requests: this can happen if the user is trying to train too many models at once
-            raise HTTPException(status_code=429, detail=response.text)
-
-        if response.status_code == 422:
+            response.raise_for_status()  # Raises HTTPStatusError for 4xx/5xx responses
+        except httpx.HTTPStatusError as e:
+            # Handle specific error codes from the training service
+            if e.response.status_code == 401:
+                raise HTTPException(
+                    status_code=401,
+                    detail="Authentication with training service failed. Please login again.",
+                )
+            if e.response.status_code == 429:
+                detail = e.response.json().get("detail", e.response.text)
+                raise HTTPException(status_code=429, detail=detail)
+            if e.response.status_code == 422:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Invalid training parameters for the backend: {e.response.text}",
+                )
             raise HTTPException(
-                status_code=422,
-                detail=f"The training request is invalid. Please check your parameters. {response.text}",
+                status_code=e.response.status_code,
+                detail=f"Error from training service: {e.response.text}",
             )
-
-        if response.status_code != 200:
+        except httpx.RequestError as e:
             raise HTTPException(
-                status_code=response.status_code,
-                detail=f"Failed to start training on the backend: {response.text}",
+                status_code=503,
+                detail=f"Could not connect to the training service: {e}",
             )
 
     response_data = response.json()
+    model_url = f"https://huggingface.co/{request.model_name}"
 
     return StartTrainingResponse(
-        message=f"Training triggered successfully, find your model at: https://huggingface.co/{request.model_name}",
-        training_id=response_data.get("training_id", None),
+        message=f"Training triggered successfully, find your model at: {model_url}",
+        training_id=response_data.get("training_id"),
+        model_url=model_url,
     )
 
 
@@ -223,7 +298,7 @@ async def start_custom_training(
         reader = process.stdout
 
     # 4) Monitor task: read from the PTY master and write to your log file
-    async def monitor_pty(reader: asyncio.StreamReader, log_path: str):
+    async def monitor_pty(reader: asyncio.StreamReader, log_path: str) -> None:
         with open(log_path, "wb") as f:
             # header
             f.write(f"Custom training started at {time.ctime()}\n".encode())
@@ -252,8 +327,10 @@ async def start_custom_training(
     return StatusResponse(message=log_file_name)
 
 
-@router.get("/training/logs/{log_file}")
-async def stream_logs(log_file: str):
+@router.get("/training/logs/{log_file}", response_model=None)
+async def stream_logs(
+    log_file: str,
+) -> StreamingResponse | HTTPException | PlainTextResponse:
     """Stream the logs from a log file"""
     log_path = os.path.join(get_home_app_path(), "logs", log_file)
 
@@ -265,7 +342,7 @@ async def stream_logs(log_file: str):
             "Streaming logs is not supported on Windows. Check the console logs directly."
         )
 
-    async def log_generator():
+    async def log_generator() -> AsyncGenerator[bytes, None]:
         """Generator to stream logs line by line as they are written"""
         with open(log_path, "rb") as f:
             # First, send all existing content
@@ -292,7 +369,7 @@ async def stream_logs(log_file: str):
 @router.post("/training/cancel", response_model=StatusResponse)
 async def cancel_training(
     request: CancelTrainingRequest,
-    session=Depends(user_is_logged_in),
+    session: SupabaseSession = Depends(user_is_logged_in),
 ) -> StatusResponse | HTTPException:
     """Cancel a training job"""
     logger.debug(f"Cancelling training request: {request}")

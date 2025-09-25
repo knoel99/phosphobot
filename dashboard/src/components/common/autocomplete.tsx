@@ -10,7 +10,13 @@ import {
 import { cn } from "@/lib/utils";
 import { Command as CommandPrimitive } from "cmdk";
 import { Check } from "lucide-react";
-import { type KeyboardEvent, useCallback, useRef, useState } from "react";
+import {
+  type KeyboardEvent,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 
 export type Option = Record<"value" | "label", string> & Record<string, string>;
 
@@ -41,6 +47,12 @@ export const AutoComplete = ({
   const [isOpen, setOpen] = useState(false);
   const [selected, setSelected] = useState<Option>(value as Option);
   const [inputValue, setInputValue] = useState<string>(value?.label || "");
+
+  // Sync internal state when value prop changes
+  useEffect(() => {
+    setSelected(value as Option);
+    setInputValue(value?.label || "");
+  }, [value]);
 
   const handleKeyDown = useCallback(
     (event: KeyboardEvent<HTMLDivElement>) => {
@@ -74,12 +86,12 @@ export const AutoComplete = ({
 
   const handleBlur = useCallback(() => {
     setOpen(false);
-    setInputValue(selected?.label);
+    setInputValue(selected?.label || "");
   }, [selected]);
 
   const handleSelectOption = useCallback(
     (option: Option) => {
-      setInputValue(option.label);
+      setInputValue(option.label || "");
       setSelected(option);
       onValueChange?.(option);
       // blur to close
@@ -110,11 +122,11 @@ export const AutoComplete = ({
       <div className="relative mt-1">
         <div
           className={cn(
-            "animate-in fade-in-0 zoom-in-95 absolute top-0 z-10 w-full rounded-xl bg-white outline-none",
+            "animate-in fade-in-0 zoom-in-95 absolute top-0 z-10 w-full outline-none",
             isOpen ? "block" : "hidden",
           )}
         >
-          <CommandList className="rounded-lg ring-1 ring-slate-200">
+          <CommandList className="rounded-sm ring-1 bg-card text-muted-foreground shadow-md">
             {isLoading && <CommandLoading isLoading={isLoading} />}
 
             {options.length > 0 && (
@@ -162,7 +174,7 @@ export const AutoComplete = ({
             )}
 
             {!isLoading && options.length === 0 && !hasCustom && (
-              <CommandPrimitive.Empty className="select-none rounded-sm px-2 py-3 text-center text-sm">
+              <CommandPrimitive.Empty className="select-none px-2 py-3 text-center text-sm">
                 {emptyMessage}
               </CommandPrimitive.Empty>
             )}

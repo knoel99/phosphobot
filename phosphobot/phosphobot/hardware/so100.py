@@ -1,8 +1,11 @@
 import asyncio
 import time
-from typing import Literal, Optional
+import traceback
+from typing import Any, Dict, List, Literal, Optional, Tuple, cast
 
 import numpy as np
+import serial
+from fastapi import HTTPException
 from loguru import logger
 from serial.tools.list_ports_common import ListPortInfo
 
@@ -10,6 +13,7 @@ from phosphobot.configs import SimulationMode, config
 from phosphobot.control_signal import ControlSignal
 from phosphobot.hardware.base import BaseManipulator
 from phosphobot.hardware.motors.feetech import FeetechMotorsBus  # type: ignore
+from phosphobot.models import RobotConfigStatus
 from phosphobot.utils import get_resources_path
 
 
@@ -22,20 +26,11 @@ class SO100Hardware(BaseManipulator):
 
     AXIS_ORIENTATION = [0, 0, 1, 1]
 
-    # Control commands (refer to the Feetech SCServo manual)
-    TORQUE_ENABLE = 0x01
-    TORQUE_DISABLE = 0
-
-    TORQUE_ADDRESS = 0x40
-
-    COMMAND_WRITE = 0x03
-    COMMAND_READ = 0x02
-
     END_EFFECTOR_LINK_INDEX = 4
     GRIPPER_JOINT_INDEX = 5
 
-    # Dynamixel settings
-    motors = {
+    # Feetech settings
+    motors: Dict[str, List[object]] = {
         # name: (index, model)
         "shoulder_pan": [1, "sts3215"],
         "shoulder_lift": [2, "sts3215"],
@@ -73,11 +68,12 @@ class SO100Hardware(BaseManipulator):
     _gravity_task: Optional[asyncio.Task] = None
 
     @property
-    def servo_id_to_motor_name(self):
-        return {v[0]: k for k, v in self.motors.items()}
+    def servo_id_to_motor_name(self) -> Dict[int, str]:
+        output: Dict[int, str] = {cast(int, v[0]): k for k, v in self.motors.items()}
+        return output
 
     @classmethod
-    def from_port(cls, port: ListPortInfo, **kwargs) -> Optional["SO100Hardware"]:
+    def from_port(cls, port: ListPortInfo, **kwargs: Any) -> Optional["SO100Hardware"]:
         """
         Detect if the device is a SO-100 robot.π
         """
@@ -89,7 +85,7 @@ class SO100Hardware(BaseManipulator):
             return robot
         return None
 
-    async def connect(self):
+    async def connect(self) -> None:
         """
         Connect to the robot.
         """
@@ -97,15 +93,36 @@ class SO100Hardware(BaseManipulator):
             logger.warning(
                 "Can't connect: no plugged robot detected (no device_name). Please plug the robot, then restart the server."
             )
-            return
+            return None
 
-        # Create serial connection
-        self.motors_bus = FeetechMotorsBus(port=self.device_name, motors=self.motors)
-        self.motors_bus.connect()
-        self.is_connected = True
+        try:
+            assert (
+                self.device_name is not None
+            ), "Device name must be set before connecting."
+            # Create serial connection
+            self.motors_bus = FeetechMotorsBus(
+                port=self.device_name, motors=self.motors
+            )
+            self.motors_bus.connect()
+        except serial.SerialException as e:
+            if "Access is denied" in str(e):
+                logger.warning(
+                    f"Failed to add robot connection: {e}\n{traceback.format_exc()}"
+                )
+            elif "Permission denied" in str(e):
+                logger.warning(
+                    f"Failed to add robot connection: {e}\n{traceback.format_exc()}"
+                )
+            else:
+                logger.warning(
+                    f"Failed to add robot connection (SerialException): {e}\n{traceback.format_exc()}"
+                )
+            return None
         self.init_config()
+        self._max_temperature_cache: dict = {}
+        self.is_connected = True
 
-    def disconnect(self):
+    def disconnect(self) -> None:
         """
         Disconnect the robot.
         """
@@ -115,32 +132,43 @@ class SO100Hardware(BaseManipulator):
             logger.warning(f"Error disconnecting motors: {e}")
         self.is_connected = False
 
-    def enable_torque(self):
+    def enable_torque(self) -> None:
         if not self.is_connected:
-            return
+            return None
+        if self.config is None:
+            logger.warning("Robot config is not initialized. Cannot enable torque.")
+            return None
 
         try:
             self.motors_bus.write("Torque_Enable", 1)
             for servo_id, c in enumerate(self.config.pid_gains):
                 self._set_pid_gains_motors(
-                    servo_id + 1, p_gain=c.p_gain, i_gain=c.i_gain, d_gain=c.d_gain
+                    servo_id + 1,
+                    p_gain=int(c.p_gain),
+                    i_gain=int(c.i_gain),
+                    d_gain=int(c.d_gain),
                 )
             self.motor_communication_errors = 0
         except Exception as e:
             logger.warning(f"Error enabling torque: {e}")
             self.update_motor_errors()
-            return
+            return None
 
-    def disable_torque(self):
+    def disable_torque(self) -> None:
         # Disable torque
         if not self.is_connected:
-            return
-
-        self.motors_bus.write("Torque_Enable", 0)
+            return None
+        try:
+            self.motors_bus.write("Torque_Enable", 0)
+            self.motor_communication_errors = 0
+        except Exception as e:
+            logger.warning(f"Error disabling torque: {e}")
+            self.update_motor_errors()
+            return None
 
     def _set_pid_gains_motors(
         self, servo_id: int, p_gain: int = 32, i_gain: int = 0, d_gain: int = 32
-    ):
+    ) -> None:
         """
         Set the PID gains for the Feetech servo.
 
@@ -179,7 +207,30 @@ class SO100Hardware(BaseManipulator):
                 "Motors torque is disabled. Motors must have torque enabled to change PID coefficients. Enable torque first."
             )
 
-    def update_motor_errors(self):
+    def _get_pid_gains_motor(self, servo_id: int) -> Optional[Tuple[int, int, int]]:
+        """
+        Get the PID gains for the Feetech servo.
+
+        :servo_id: Joint ID (0-6)
+        :return: Tuple of (p_gain, i_gain, d_gain)
+        """
+        try:
+            p_gain = self.motors_bus.read(
+                "P_Coefficient", motor_names=self.servo_id_to_motor_name[servo_id]
+            )
+            i_gain = self.motors_bus.read(
+                "I_Coefficient", motor_names=self.servo_id_to_motor_name[servo_id]
+            )
+            d_gain = self.motors_bus.read(
+                "D_Coefficient", motor_names=self.servo_id_to_motor_name[servo_id]
+            )
+            return int(p_gain), int(i_gain), int(d_gain)
+        except Exception as e:
+            logger.warning(f"Error reading PID gains: {e}")
+            self.update_motor_errors()
+            return None
+
+    def update_motor_errors(self) -> None:
         """
         Every time a motor communication error is detected, increment the error counter.
         If the counter reaches a certain threshold, disconnect the robot.
@@ -192,7 +243,7 @@ class SO100Hardware(BaseManipulator):
             logger.error("Too many communication errors. Disconnecting robot.")
             self.disconnect()
 
-    def read_motor_position(self, servo_id: int, **kwargs) -> int | None:
+    def read_motor_position(self, servo_id: int, **kwargs: Any) -> Optional[int]:
         """
         Read the position of a Feetech servo.
         """
@@ -210,7 +261,7 @@ class SO100Hardware(BaseManipulator):
             self.update_motor_errors()
             return None
 
-    def write_motor_position(self, servo_id: int, units: int, **kwargs) -> None:
+    def write_motor_position(self, servo_id: int, units: int, **kwargs: Any) -> None:
         """
         Write a position to a Feetech servo.
         """
@@ -239,8 +290,9 @@ class SO100Hardware(BaseManipulator):
 
         values = q_target.tolist()
         motor_names = list(self.motors.keys())
+
+        # Gripper is the last parameter of q_target (last motor)
         if not enable_gripper:
-            # Gripper is the last parameter of q_target (last motor)
             values = values[:-1]
             motor_names = motor_names[:-1]
 
@@ -275,7 +327,7 @@ class SO100Hardware(BaseManipulator):
             return np.ones(6) * np.nan
         return motor_positions
 
-    def read_motor_torque(self, servo_id: int, **kwargs) -> float | None:
+    def read_motor_torque(self, servo_id: int, **kwargs: Any) -> Optional[float]:
         """
         Read the torque of a Feetech servo.
         """
@@ -293,7 +345,7 @@ class SO100Hardware(BaseManipulator):
             self.update_motor_errors()
             return None
 
-    def read_motor_voltage(self, servo_id: int, **kwargs) -> float | None:
+    def read_motor_voltage(self, servo_id: int, **kwargs: Any) -> Optional[float]:
         """
         Read the voltage of a Feetech servo.
         """
@@ -308,6 +360,71 @@ class SO100Hardware(BaseManipulator):
             return voltage / 10.0  # unit is 0.1V
         except Exception as e:
             logger.warning(f"Error reading motor voltage for servo {servo_id}: {e}")
+            self.update_motor_errors()
+            return None
+
+    def status(self) -> RobotConfigStatus:
+        temperature = self.current_temperature()
+        return RobotConfigStatus(
+            name=self.name,
+            device_name=getattr(self, "SERIAL_ID", None),
+            temperature=temperature,
+        )
+
+    def read_motor_temperature(
+        self, servo_id: int, **kwargs: Any
+    ) -> Optional[Tuple[float, float]]:
+        """
+        Read the temperature of a Feetech servo.
+        """
+        if not self.is_connected:
+            return None
+        try:
+            present_temperature = self.motors_bus.read(
+                "Present_Temperature",
+                motor_names=self.servo_id_to_motor_name[servo_id],
+            )
+            if servo_id not in self._max_temperature_cache:
+                max_temp = self.motors_bus.read(
+                    "Max_Temperature_Limit",
+                    motor_names=self.servo_id_to_motor_name[servo_id],
+                )
+                self._max_temperature_cache[servo_id] = float(max_temp.item())
+            self.motor_communication_errors = 0
+
+            return (
+                float(present_temperature.item()),
+                self._max_temperature_cache[servo_id],
+            )  # unit is Celsius
+        except Exception as e:
+            logger.warning(f"Error reading motor temperature for servo {servo_id}: {e}")
+            self.update_motor_errors()
+            return None
+
+    def write_group_motor_maximum_temperature(
+        self, maximum_temperature_target: List[int], **kwargs: Any
+    ) -> None:
+        """
+        Write the maximum temperature of all motors of a robot.
+        """
+        if not self.is_connected:
+            return None
+        values = maximum_temperature_target
+        motor_names = list(self.motors.keys())
+        try:
+            self.motors_bus.write(
+                "Lock", values=[0] * len(motor_names), motor_names=motor_names
+            )
+            self.motors_bus.write(
+                "Max_Temperature_Limit", values=values, motor_names=motor_names
+            )
+            self.motors_bus.write(
+                "Lock", values=[1] * len(motor_names), motor_names=motor_names
+            )
+            self._max_temperature_cache = {}
+            self.motor_communication_errors = 0
+        except Exception as e:
+            logger.warning(f"Error writing motor temperature: {e}")
             self.update_motor_errors()
             return None
 
@@ -381,7 +498,6 @@ class SO100Hardware(BaseManipulator):
             )
 
         if self.calibration_current_step == 1:
-            await self.connect()
             # Set the offset to the middle of the motor range
             self.calibrate_motors()
             self.config.servos_offsets = self.read_joints_position(
@@ -426,6 +542,17 @@ class SO100Hardware(BaseManipulator):
                     "Calibration failed: joint positions are NaN. Please check that every wire of the robot is plugged correctly.",
                 )
 
+            # If any of the joint positions are the same as the offsets, we cannot continue
+            if np.any(
+                np.array(self.config.servos_calibration_position)
+                == np.array(self.config.servos_offsets)
+            ):
+                self.calibration_current_step = 0
+                return (
+                    "error",
+                    "Calibration failed: joint positions are the same as the offsets. Please check that every wire of the robot is plugged correctly.",
+                )
+
             self.config.servos_offsets_signs = np.sign(
                 (
                     np.array(self.config.servos_calibration_position)
@@ -448,7 +575,7 @@ class SO100Hardware(BaseManipulator):
             f"Invalid calibration step: {self.calibration_current_step}, must be between 0 and {self.calibration_max_steps - 1}"
         )
 
-    def calibrate_motors(self, **kwargs) -> None:
+    def calibrate_motors(self, **kwargs: Any) -> None:
         """
         This is called during the calibration phase of the robot.
         It sets the offset of all motors to self.RESOLUTION/2.
@@ -463,7 +590,7 @@ class SO100Hardware(BaseManipulator):
     async def gravity_compensation_loop(
         self,
         control_signal: ControlSignal,
-    ):
+    ) -> None:
         """
         Background task that implements gravity compensation control:
         - Applies gravity compensation to the robot
@@ -511,7 +638,7 @@ class SO100Hardware(BaseManipulator):
 
         # Main control loop
         while control_signal.is_in_loop():
-            start_time = time.time()
+            start_time = time.perf_counter()
 
             # Get leader's current joint positions
             pos_rad = self.read_joints_position(unit="rad")
@@ -534,10 +661,10 @@ class SO100Hardware(BaseManipulator):
 
             # Apply gravity compensation to leader
             theta_des_rad = pos_rad + alpha[:num_joints] * np.array(tau_g)
-            self.write_joint_positions(theta_des_rad, unit="rad")
+            self.write_joint_positions(theta_des_rad.tolist(), unit="rad")
 
             # Maintain loop frequency
-            elapsed = time.time() - start_time
+            elapsed = time.perf_counter() - start_time
             sleep_time = max(0, loop_period - elapsed)
             await asyncio.sleep(sleep_time)
 

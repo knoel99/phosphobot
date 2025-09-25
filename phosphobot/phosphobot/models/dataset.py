@@ -1,17 +1,19 @@
 import asyncio
+import concurrent
 import datetime
 import json
 import os
 import shutil
 import time
 from abc import ABC, abstractmethod
+from concurrent.futures import Future
 from pathlib import Path
-from typing import List, Literal, Optional, cast
+from typing import Any, Dict, List, Literal, Optional, cast
 
 import numpy as np
 from huggingface_hub import (
+    CommitInfo,
     HfApi,
-    create_branch,
     create_repo,
     delete_folder,
     delete_repo,
@@ -43,15 +45,15 @@ class Observation(BaseModel):
     # Current joints positions of the robot
     joints_position: np.ndarray
     # Instruction given to the robot, can be null when recording the dataset
-    language_instruction: str | None = None
+    language_instruction: Optional[str] = None
     # Timestamp in seconds since episode start (usefull for frequency)
-    timestamp: float | None = None
+    timestamp: Optional[float] = None
 
     # To be able to use np.array in pydantic, we need to use arbitrary_types_allowed = True
     class Config:
         arbitrary_types_allowed = True
 
-    def dict(self, *args, **kwargs):
+    def dict(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
         # Override dict method to handle numpy arrays
         d = super().dict(*args, **kwargs)
         return d
@@ -61,12 +63,13 @@ class Step(BaseModel):
     observation: Observation  # Current observation, most informations are stored here
     # Robot action as outputed by OpenVLA (size 7 array) based on the CURRENT observation
     action: Optional[np.ndarray] = None
+    action_cartesian: Optional[np.ndarray] = None  # Full state when action was taken
     # if this is the first step of an episode that contains the initial state.
-    is_first: bool | None = None
+    is_first: Optional[bool] = None
     # True if this is a terminal step, meaning the episode isn' over after this step but the robot is in a terminal state
-    is_terminal: bool | None = None
+    is_terminal: Optional[bool] = None
     # if this is the last step of an episode, that contains the last observation. When true,
-    is_last: bool | None = None
+    is_last: Optional[bool] = None
     reward: float = 0.0  # Reward given by the environment
     # Discount factor for the reward, not used for now
     discount: float = 1.0
@@ -89,7 +92,7 @@ class BaseEpisode(BaseModel, ABC):
         arbitrary_types_allowed = True
         extra = "allow"  # Allow extra fields like dataset_manager for LeRobotEpisode not in schema
 
-    def add_step(self, step: Step):
+    def add_step(self, step: Step) -> None:
         """Common logic for adding a step to the internal list and managing flags."""
         # is_terminal and is_last are true by default for a new step
         step.is_terminal = True
@@ -114,7 +117,7 @@ class BaseEpisode(BaseModel, ABC):
 
         self.steps.append(step)
 
-    def update_previous_step(self, current_step_data: Step):
+    def update_previous_step(self, current_step_data: Step) -> None:
         """
         Updates the 'action' of the previous step.
         The action that led to `current_step_data.observation` was `current_step_data.observation.joints_position`.
@@ -142,7 +145,7 @@ class BaseEpisode(BaseModel, ABC):
         return int(idx)
 
     @episode_index.setter
-    def episode_index(self, value: int):
+    def episode_index(self, value: int) -> None:
         self.metadata["episode_index"] = value
 
     @property
@@ -151,17 +154,17 @@ class BaseEpisode(BaseModel, ABC):
 
     @classmethod
     @abstractmethod
-    async def start_new(cls, **kwargs) -> "BaseEpisode":  # type: ignore[misc]
+    async def start_new(cls, **kwargs: Dict[str, Any]) -> "BaseEpisode":  # type: ignore[misc]
         """Factory method to create and initialize a new episode."""
         pass
 
     @abstractmethod
-    async def append_step(self, step: Step, **kwargs) -> None:
+    async def append_step(self, step: Step, **kwargs: Dict[str, Any]) -> None:
         """Appends a step and handles related business logic (e.g., updating live meta files)."""
         pass
 
     @abstractmethod
-    async def save(self, **kwargs) -> None:
+    async def save(self, **kwargs: Dict[str, Any]) -> None:
         """Saves the episode data and any related metadata or artifacts."""
         pass
 
@@ -222,7 +225,7 @@ class BaseEpisode(BaseModel, ABC):
         playback_speed: float = 1.0,
         interpolation_factor: int = 4,
         replicate: bool = False,
-    ):
+    ) -> None:
         """
         Play the episode on the robot with on-the-fly interpolation.
         """
@@ -264,11 +267,11 @@ class BaseEpisode(BaseModel, ABC):
                 next_step is not None
                 and curr_step.observation.timestamp is not None
                 and next_step.observation.timestamp is not None
-                and curr_step.observation.joints_position is not None
-                and next_step.observation.joints_position is not None
+                and curr_step.action is not None
+                and next_step.action is not None
             ):
                 # if the current step is all NAN, skip
-                if np.isnan(curr_step.observation.joints_position).all():
+                if np.isnan(curr_step.action).all():
                     logger.warning(
                         f"Skipping step {index} because all joints positions are NaN"
                     )
@@ -284,10 +287,10 @@ class BaseEpisode(BaseModel, ABC):
                 )
 
                 # Fill empty values from the next step joints with the current step
-                next_step.observation.joints_position = np.where(
-                    np.isnan(next_step.observation.joints_position),
-                    curr_step.observation.joints_position,
-                    next_step.observation.joints_position,
+                next_step.action = np.where(
+                    np.isnan(next_step.action),
+                    curr_step.action,
+                    next_step.action,
                 )
 
                 # Perform interpolation steps
@@ -298,9 +301,7 @@ class BaseEpisode(BaseModel, ABC):
                     t = i / interpolation_factor
 
                     # Interpolate between the current and next step
-                    interp_value = t * (next_step.observation.joints_position) + (
-                        1 - t
-                    ) * (curr_step.observation.joints_position)
+                    interp_value = t * (next_step.action) + (1 - t) * (curr_step.action)
 
                     if index % 20 == 0 and i == 0:
                         logger.info(f"Playing step {index}")
@@ -314,7 +315,11 @@ class BaseEpisode(BaseModel, ABC):
             else:
                 # Handle last step or cases where timestamp is None
                 start_time = time.perf_counter()
-                move_robots(curr_step.observation.joints_position)
+                if (
+                    curr_step.action is not None
+                    and not np.isnan(curr_step.action).all()
+                ):
+                    move_robots(curr_step.action)
 
 
 class JsonEpisode(BaseEpisode):
@@ -351,7 +356,7 @@ class JsonEpisode(BaseEpisode):
         robots: List[BaseRobot],
         instruction: Optional[str] = None,
         freq: Optional[int] = None,  # Optional for JSON, might be useful for metadata
-        **kwargs,
+        **kwargs: Any,
     ) -> "JsonEpisode":
         start_timestamp = time.time()
         created_at_string = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -374,10 +379,10 @@ class JsonEpisode(BaseEpisode):
         logger.info(f"Starting new JSON episode for dataset '{dataset_name}'.")
         return cls(steps=[], metadata=metadata)
 
-    async def append_step(self, step: Step, **kwargs) -> None:
+    async def append_step(self, step: Step, **kwargs: Any) -> None:
         self.add_step(step)  # Uses BaseEpisode.add_step
 
-    async def save(self, **kwargs) -> None:
+    async def save(self, **kwargs: Any) -> None:
         if not self.steps:
             logger.warning("JSON Episode has no steps. Skipping save.")
             return
@@ -404,8 +409,8 @@ class JsonEpisode(BaseEpisode):
 
         return cls(**data_dict)
 
-    def delete(self):
-        os.remove(self.json_path)
+    def delete(self) -> None:
+        os.remove(self._json_episode_path)
 
 
 class BaseDataset:
@@ -479,7 +484,7 @@ class BaseDataset:
         return name
 
     @classmethod
-    def remove_ds_store_files(cls, folder_path: str):
+    def remove_ds_store_files(cls, folder_path: str) -> None:
         try:
             # Iterate through all items in the folder
             for item in os.listdir(folder_path):
@@ -505,12 +510,12 @@ class BaseDataset:
         repo_id = f"{get_hf_username_or_orgid()}/{self.dataset_name}"
         return repo_id
 
-    def check_repo_exists(self, repo_id: str | None) -> bool:
+    def check_repo_exists(self, repo_id: Optional[str]) -> bool:
         """Check if a repository exists on Hugging Face"""
         repo_id = repo_id or self.repo_id
         return self.HF_API.repo_exists(repo_id=repo_id, repo_type="dataset")
 
-    def sync_local_to_hub(self):
+    def sync_local_to_hub(self) -> None:
         """Reupload the dataset folder to Hugging Face"""
         username_or_orgid = get_hf_username_or_orgid()
         if username_or_orgid is None:
@@ -591,14 +596,16 @@ task_categories:
 
 # {dataset_name}
 
-**This dataset was generated using a [phospho starter pack](https://robots.phospho.ai).**
+**This dataset was generated using [phosphobot](https://docs.phospho.ai).**
 
 This dataset contains a series of episodes recorded with a robot and multiple cameras. \
 It can be directly used to train a policy using imitation learning. \
-It's compatible with LeRobot and RLDS.
+It's compatible with LeRobot.
+
+To get started in robotics, [get your own phospho starter pack.](https://robots.phospho.ai).
 """
 
-    def push_dataset_to_hub(self, branch_path: str | None = None):
+    def push_dataset_to_hub(self, branch_path: Optional[str] = None) -> None:
         """
         Push the dataset to the Hugging Face Hub.
 
@@ -619,7 +626,7 @@ It's compatible with LeRobot and RLDS.
                     logger.error("Could not get username or org ID from token")
                     return
 
-            except Exception as e:
+            except Exception:
                 logger.warning(
                     "No user or org with write access found. Won't be able to push to Hugging Face."
                 )
@@ -635,13 +642,14 @@ It's compatible with LeRobot and RLDS.
 
             # Construct full repo name
             dataset_repo_name = f"{username_or_org_id}/{self.dataset_name}"
-            create_2_1_branch = False
 
             # Check if repo exists, create if it doesn't
             try:
                 self.HF_API.repo_info(repo_id=dataset_repo_name, repo_type="dataset")
                 logger.info(f"Repository {dataset_repo_name} already exists.")
             except Exception:
+                from phosphobot.configs import config
+
                 logger.info(
                     f"Repository {dataset_repo_name} does not exist. Creating it..."
                 )
@@ -650,86 +658,72 @@ It's compatible with LeRobot and RLDS.
                     repo_type="dataset",
                     exist_ok=True,
                     token=True,
+                    private=config.DEFAULT_HF_PRIVATE_MODE,
                 )
                 logger.info(f"Repository {dataset_repo_name} created.")
-                create_2_1_branch = True
 
             # Push to main branch
             logger.info(
                 f"Pushing the dataset to the main branch in repository {dataset_repo_name}"
             )
-            self.HF_API.upload_folder(
+            future = self.HF_API.upload_folder(
                 folder_path=self.folder_full_path,
                 repo_id=dataset_repo_name,
+                revision="main",
                 repo_type="dataset",
                 run_as_future=True,
             )
 
-            repo_refs = self.HF_API.list_repo_refs(
-                repo_id=dataset_repo_name, repo_type="dataset"
-            )
-            existing_branch_names = [ref.name for ref in repo_refs.branches]
-
-            # Create and push to v2.1 branch if needed
-            if create_2_1_branch:
+            def sync_branch(fut: Future[CommitInfo]) -> None:
                 try:
-                    if "v2.1" not in existing_branch_names:
-                        logger.info(
-                            f"Creating branch v2.1 for dataset {dataset_repo_name}"
-                        )
-                        create_branch(
-                            dataset_repo_name,
+                    fut.result()  # raises if upload failed
+
+                    # Force-sync v2.1 with main
+                    try:
+                        self.HF_API.delete_branch(
+                            repo_id=dataset_repo_name,
                             repo_type="dataset",
                             branch="v2.1",
-                            token=True,
                         )
-                        logger.info(
-                            f"Branch v2.1 created for dataset {dataset_repo_name}"
-                        )
+                        logger.info("Deleted existing branch v2.1 before re-creating.")
+                    except Exception:
+                        logger.info("Branch v2.1 did not exist, creating fresh.")
 
-                    # Push to v2.1 branch
-                    logger.info(
-                        f"Pushing the dataset to the branch v2.1 in repository {dataset_repo_name}"
-                    )
-                    self.HF_API.upload_folder(
-                        folder_path=self.folder_full_path,
+                    self.HF_API.create_branch(
                         repo_id=dataset_repo_name,
                         repo_type="dataset",
-                        revision="v2.1",
-                        run_as_future=True,
+                        revision="main",  # copy from updated main
+                        branch="v2.1",
                     )
-                except Exception as e:
-                    logger.error(f"Error handling v2.1 branch: {e}")
+                    logger.info("Branch v2.1 synced with main.")
 
-            # Push to additional branch if specified
-            if branch_path:
-                try:
-                    if branch_path not in existing_branch_names:
-                        logger.info(
-                            f"Creating branch {branch_path} for dataset {dataset_repo_name}"
-                        )
-                        create_branch(
-                            dataset_repo_name,
+                    if branch_path:
+                        try:
+                            self.HF_API.delete_branch(
+                                repo_id=dataset_repo_name,
+                                repo_type="dataset",
+                                branch=branch_path,
+                            )
+                            logger.info(
+                                f"Deleted existing branch {branch_path} before re-creating."
+                            )
+                        except Exception:
+                            logger.info(
+                                f"Branch {branch_path} did not exist, creating fresh."
+                            )
+
+                        self.HF_API.create_branch(
+                            repo_id=dataset_repo_name,
                             repo_type="dataset",
+                            revision="main",
                             branch=branch_path,
-                            token=True,
                         )
-                        logger.info(
-                            f"Branch {branch_path} created for dataset {dataset_repo_name}"
-                        )
+                        logger.info(f"Branch {branch_path} synced with main.")
 
-                    # Push to specified branch
-                    logger.info(f"Pushing the dataset to branch {branch_path}")
-                    self.HF_API.upload_folder(
-                        folder_path=self.folder_full_path,
-                        repo_id=dataset_repo_name,
-                        repo_type="dataset",
-                        revision=branch_path,
-                        run_as_future=True,
-                    )
-                    logger.info(f"Dataset pushed to branch {branch_path}")
                 except Exception as e:
-                    logger.error(f"Error handling custom branch: {e}")
+                    logger.error(f"Failed to sync branch: {e}")
+
+            future.add_done_callback(sync_branch)
 
         except Exception as e:
             logger.warning(f"An error occurred: {e}")

@@ -15,26 +15,21 @@ interface AuthContextType {
   login: (email: string, password: string, session?: Session) => Promise<void>;
   signup: (email: string, password: string) => Promise<void>;
   logout: () => Promise<void>;
+  verifyEmailCode: (email: string, token: string) => Promise<void>;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
 export function AuthProvider({ children }: { children: ReactNode }) {
-  const [session, setSession] = useState<Session | null>(null);
-  const [isLoading, setIsLoading] = useState<boolean>(true);
-  const [proUser, setProUser] = useState<boolean | null>(null);
-
-  useEffect(() => {
-    const storedSession = localStorage.getItem("session");
-    if (storedSession) {
-      setSession(JSON.parse(storedSession));
-    }
-    const storedProUser = localStorage.getItem("proUser");
-    if (storedProUser) {
-      setProUser(JSON.parse(storedProUser));
-    }
-    setIsLoading(false);
-  }, []);
+  const [session, setSession] = useState<Session | null>(() => {
+    const stored = localStorage.getItem("session");
+    return stored ? JSON.parse(stored) : null;
+  });
+  const [isLoading, setIsLoading] = useState<boolean>(false);
+  const [proUser, setProUser] = useState<boolean | null>(() => {
+    const stored = localStorage.getItem("proUser");
+    return stored ? JSON.parse(stored) : null;
+  });
 
   const login = async (
     email: string,
@@ -82,19 +77,59 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const logout = async (): Promise<void> => {
     await fetchWithBaseUrl("/auth/logout", "POST");
     localStorage.removeItem("session");
+    localStorage.removeItem("proUser");
     setSession(null);
+    setProUser(null);
+    // Redirect to main page if we're on a protected route
+    if (
+      window.location.pathname === "/train" ||
+      window.location.pathname === "/inference"
+    ) {
+      window.location.href = "/";
+    }
+  };
+
+  const verifyEmailCode = async (
+    email: string,
+    token: string,
+  ): Promise<void> => {
+    const data = await fetchWithBaseUrl("/auth/verify-email-token", "POST", {
+      email,
+      token,
+    });
+    console.log("Email verification response:", data);
+    if (data.session) {
+      localStorage.setItem("session", JSON.stringify(data.session));
+      setSession(data.session);
+    } else {
+      throw new Error("Invalid verification code");
+    }
   };
 
   const validateSession = async () => {
+    setIsLoading(true);
     try {
-      const response: { authenticated: boolean; session: Session } =
-        await fetchWithBaseUrl("/auth/check_auth", "GET");
+      const response: {
+        authenticated: boolean;
+        session: Session;
+        is_pro_user: boolean;
+      } = await fetchWithBaseUrl("/auth/check-auth", "GET");
       if (!response.authenticated) {
+        setProUser(null);
+        localStorage.removeItem("proUser");
         logout();
       }
+      // Update pro user status
+      setProUser(response.is_pro_user);
+      localStorage.setItem("proUser", JSON.stringify(response.is_pro_user));
     } catch (e) {
       console.error("Session validation failed:", e);
+      // Reset pro user status on validation failure
+      setProUser(null);
+      localStorage.removeItem("proUser");
       logout();
+    } finally {
+      setIsLoading(false);
     }
   };
 
@@ -102,11 +137,19 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     if (session) {
       validateSession();
     }
-  }, [isLoading, session]);
+  }, [session]);
 
   return (
     <AuthContext.Provider
-      value={{ session, isLoading, proUser, login, signup, logout }}
+      value={{
+        session,
+        isLoading,
+        proUser,
+        login,
+        signup,
+        logout,
+        verifyEmailCode,
+      }}
     >
       {children}
     </AuthContext.Provider>

@@ -1,7 +1,8 @@
-from typing import Any, Dict, List, Literal, Optional
+import uuid
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import numpy as np
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from phosphobot._version import __version__
 from phosphobot.types import VideoCodecs
@@ -16,7 +17,14 @@ from .lerobot_dataset import (
     LeRobotDataset,
     LeRobotEpisode,
 )
-from .robot import BaseRobot, BaseRobotConfig, BaseRobotPIDGains, RobotConfigStatus
+from .robot import (
+    BaseRobot,
+    BaseRobotConfig,
+    BaseRobotPIDGains,
+    RobotConfigResponse,
+    RobotConfigStatus,
+    Temperature,
+)
 
 
 class ServerStatus(BaseModel):
@@ -37,12 +45,15 @@ class ServerStatus(BaseModel):
         "stopped",
         description="Whether the robot is currently controlled by an AI model.",
     )
-    server_ip: str = Field(
-        ..., description="IP address of the server", examples=["192.168.1.X"]
-    )
     leader_follower_status: bool = Field(
         False,
         description="Whether the leader-follower control is currently active.",
+    )
+    server_ip: str = Field(
+        ..., description="IP address of the phosphobot server", examples=["192.168.1.X"]
+    )
+    server_port: int = Field(
+        ..., description="Port of the phosphobot server", examples=[80, 8020, 8021]
     )
 
 
@@ -52,9 +63,21 @@ class RobotStatus(BaseModel):
     This is sent by the robot to the app.
     """
 
-    is_object_gripped: bool | None = None
-    is_object_gripped_source: Literal["left", "right"] | None = None
+    is_object_gripped: Optional[bool] = None
+    is_object_gripped_source: Optional[Literal["left", "right"]] = None
     nb_actions_received: int
+
+
+class EndEffectorReadRequest(BaseModel):
+    sync: bool = Field(
+        False,
+        description="If True, the simulation will first read the motor positions, synchronize them with the simulated robot, and then return the end effector position."
+        + "Useful for measurements, however it will take more time to respond.",
+    )
+    only_gripper: bool = Field(
+        False,
+        description="If True, only return the gripper state. If False, return the full end effector position and orientation.",
+    )
 
 
 class EndEffectorPosition(BaseModel):
@@ -63,12 +86,12 @@ class EndEffectorPosition(BaseModel):
     All zeros means the initial position, that you get by calling /move/init
     """
 
-    x: float = Field(description="X position in centimeters")
-    y: float = Field(description="Y position in centimeters")
-    z: float = Field(description="Z position in centimeters")
-    rx: float = Field(description="Absolute Pitch in degrees")
-    ry: float = Field(description="Absolute Yaw in degrees")
-    rz: float = Field(description="Absolute Roll in degrees")
+    x: Optional[float] = Field(description="X position in centimeters")
+    y: Optional[float] = Field(description="Y position in centimeters")
+    z: Optional[float] = Field(description="Z position in centimeters")
+    rx: Optional[float] = Field(description="Absolute Pitch in degrees")
+    ry: Optional[float] = Field(description="Absolute Yaw in degrees")
+    rz: Optional[float] = Field(description="Absolute Roll in degrees")
     open: float = Field(description="0 for closed, 1 for open")
 
 
@@ -78,22 +101,22 @@ class MoveAbsoluteRequest(BaseModel):
     that you get by calling /move/init.
     """
 
-    x: float | None = Field(None, description="X position in centimeters")
-    y: float | None = Field(None, description="Y position in centimeters")
-    z: float | None = Field(None, description="Z position in centimeters")
-    rx: float | None = Field(
+    x: Optional[float] = Field(None, description="X position in centimeters")
+    y: Optional[float] = Field(None, description="Y position in centimeters")
+    z: Optional[float] = Field(None, description="Z position in centimeters")
+    rx: Optional[float] = Field(
         None,
         description="Absolute Pitch in degrees. If None, inverse kinematics will be used to calculate the best position.",
     )
-    ry: float | None = Field(
+    ry: Optional[float] = Field(
         None,
         description="Absolute Yaw in degrees. If None, inverse kinematics will be used to calculate the best position.",
     )
-    rz: float | None = Field(
+    rz: Optional[float] = Field(
         None,
         description="Absolute Roll in degrees. If None, inverse kinematics will be used to calculate the best position.",
     )
-    open: float | None = Field(None, description="0 for closed, 1 for open")
+    open: Optional[float] = Field(None, description="0 for closed, 1 for open")
 
     max_trials: int = Field(
         10,
@@ -129,7 +152,7 @@ class AppControlData(BaseModel):
     source: Literal["left", "right"] = Field(
         "right", description="Which hand the data comes from. Can be left or right."
     )
-    timestamp: float | None = Field(
+    timestamp: Optional[float] = Field(
         None, description="Unix timestamp with milliseconds"
     )
     # For moving robots, we can have a direction vector.
@@ -212,13 +235,13 @@ class RelativeEndEffectorPosition(BaseModel):
     # Dataset are in RDLS format like the Bridge Data V2 dataset
     # See https://github.com/google-research/rlds for more information
 
-    x: float | None = Field(None, description="Delta X position in centimeters")
-    y: float | None = Field(None, description="Delta Y position in centimeters")
-    z: float | None = Field(None, description="Delta Z position in centimeters")
-    rx: float | None = Field(None, description="Relative Pitch in degrees")
-    ry: float | None = Field(None, description="Relative Yaw in degrees")
-    rz: float | None = Field(None, description="Relative Roll in degrees")
-    open: float | None = Field(
+    x: Optional[float] = Field(None, description="Delta X position in centimeters")
+    y: Optional[float] = Field(None, description="Delta Y position in centimeters")
+    z: Optional[float] = Field(None, description="Delta Z position in centimeters")
+    rx: Optional[float] = Field(None, description="Relative Pitch in degrees")
+    ry: Optional[float] = Field(None, description="Relative Yaw in degrees")
+    rz: Optional[float] = Field(None, description="Relative Roll in degrees")
+    open: Optional[float] = Field(
         None, description="0 for closed, 1 for open. If None, use the last value."
     )
 
@@ -290,9 +313,13 @@ class JointsReadRequest(BaseModel):
         "rad",
         description="The unit of the angles. Defaults to radian.",
     )
-    joints_ids: List[int] | None = Field(
+    joints_ids: Optional[List[int]] = Field(
         None,
         description="If set, only read the joints with these ids. If None, read all joints.",
+    )
+    source: Literal["sim", "robot"] = Field(
+        "robot",
+        description="Source of the joint angles. 'sim' means the angles are read from the simulation, 'robot' means the angles are read from the hardware.",
     )
 
 
@@ -309,7 +336,7 @@ class JointsWriteRequest(BaseModel):
         "rad",
         description="The unit of the angles. Defaults to radian.",
     )
-    joints_ids: List[int] | None = Field(
+    joints_ids: Optional[List[int]] = Field(
         None,
         description="If set, only set the joints with these ids. If None, set all joints."
         "Example: 'angles'=[1,1,1], 'joints_ids'=[0,1,2] will set the first 3 joints to 1 radian.",
@@ -321,7 +348,7 @@ class JointsReadResponse(BaseModel):
     Response to read the joints of the robot.
     """
 
-    angles: List[float | None] = Field(
+    angles: List[Optional[float]] = Field(
         ...,
         description="A list of length 6, with the position of each joint in the unit specified in the request. If a joint is not available, its value will be None.",
     )
@@ -347,9 +374,31 @@ class VoltageReadResponse(BaseModel):
     Response to read the torque of the robot.
     """
 
-    current_voltage: List[float] | None = Field(
+    current_voltage: Optional[List[float]] = Field(
         ...,
         description="A list of length 6, with the current voltage of each joint. If the robot is not connected, this will be None.",
+    )
+
+
+class TemperatureReadResponse(BaseModel):
+    """
+    Response to read the Temperature of the robot.
+    """
+
+    current_max_Temperature: Optional[List[Temperature]] = Field(
+        ...,
+        description=" A list of Temperature objects, one for each joint. If the robot is not connected, this will be None.",
+    )
+
+
+class TemperatureWriteRequest(BaseModel):
+    """
+    Request to set the maximum Temperature for joints of the robot.
+    """
+
+    maximum_temperature: List[int] = Field(
+        ...,
+        description="A list with the maximum temperature of each joint. The length of the list must be equal to the number of joints.",
     )
 
 
@@ -359,11 +408,11 @@ class InfoResponse(BaseModel):
     """
 
     status: Literal["ok", "error"] = "ok"
-    robot_type: str | None = None
-    robot_dof: int | None = None
-    number_of_episodes: int | None = None
-    image_keys: List[str] | None = None
-    image_frames: Dict[str, str] | None = None
+    robot_type: Optional[str] = None
+    robot_dof: Optional[int] = None
+    number_of_episodes: Optional[int] = None
+    image_keys: Optional[List[str]] = None
+    image_frames: Optional[Dict[str, str]] = None
 
 
 class StatusResponse(BaseModel):
@@ -374,18 +423,24 @@ class StatusResponse(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     status: Literal["ok", "error"] = "ok"
-    message: str | None = None
+    message: Optional[str] = None
+
+
+class HFWhoamIResponse(StatusResponse):
+    username: Optional[str] = None
 
 
 class TrainingInfoRequest(BaseModel):
-    model_id: str = Field(..., description="Hugging Face model id to get training info")
-    model_type: Literal["gr00t", "ACT", "ACT_BBOX", "custom"]
+    model_id: Optional[str] = Field(
+        None, description="Hugging Face model id to get training info"
+    )
+    model_type: Literal["pi0.5", "gr00t", "ACT", "ACT_BBOX", "custom"]
 
 
 class TrainingInfoResponse(BaseModel):
     status: Literal["ok", "error"]
-    message: str | None = None
-    training_body: dict | None = None
+    message: Optional[str] = None
+    training_body: Optional[dict] = None
 
 
 class ServerInfoResponse(BaseModel):
@@ -454,7 +509,7 @@ class AIControlStatusResponse(StatusResponse):
     Response when starting the AI control.
     """
 
-    server_info: ServerInfoResponse | None = None
+    server_info: Optional[ServerInfoResponse] = None
     ai_control_signal_id: str
     ai_control_signal_status: Literal["stopped", "running", "paused", "waiting"]
 
@@ -464,53 +519,71 @@ class RecordingStartRequest(BaseModel):
     Request to start the recording of an episode.
     """
 
-    dataset_name: str | None = Field(
+    dataset_name: Optional[str] = Field(
         None,
         description="Name of the dataset to save the episode in."
         + "If None, defaults to the value set in Admin Configuration.",
         examples=["example_dataset"],
     )
-    episode_format: Literal["json", "lerobot_v2", "lerobot_v2.1"] | None = Field(
+    episode_format: Optional[Literal["json", "lerobot_v2", "lerobot_v2.1"]] = Field(
         None,
         description="Format to save the episode.\n`json` is compatible with OpenVLA and stores videos as a series of npy.\n`lerobot_v2` is compatible with [lerobot training.](https://docs.phospho.ai/learn/ai-models)."
         + "If None, defaults to the value set in Admin Configuration.",
         examples=["lerobot_v2.1"],
     )
-    video_codec: VideoCodecs | None = Field(
+    video_codec: Optional[VideoCodecs] = Field(
         None,
         description="Codec to use for the video saving."
         + "If None, defaults to the value set in Admin Configuration.",
         examples=["avc1"],
     )
-    freq: int | None = Field(
+    freq: Optional[int] = Field(
         None,
         description="Records steps of the robot at this frequency."
         + "If None, defaults to the value set in Admin Configuration.",
         examples=[30],
     )
-    branch_path: str | None = Field(
+    branch_path: Optional[str] = Field(
         None,
         description="Path to the branch to push the dataset to, in addition to the main branch. If set to None, only push to the main branch. Defaults to None.",
     )
-    target_video_size: tuple[int, int] | None = Field(
+    target_video_size: Optional[Tuple[int, int]] = Field(
         None,
         description="Target video size for the recording, all videos in the dataset should have the same size. If set to None, defaults to the value set in Admin Configuration.",
         examples=[(320, 240)],
     )
-    cameras_ids_to_record: List[int] | None = Field(
+    cameras_ids_to_record: Optional[List[int]] = Field(
         None,
         description="List of camera ids to record. If set to None, records all available cameras.",
         examples=[[0, 1]],
     )
-    instruction: str | None = Field(
+    instruction: Optional[str] = Field(
         None,
         description="A text describing the recorded task. If set to None, defaults to the value set in Admin Configuration.",
         examples=["Pick up the orange brick and put it in the black box."],
     )
-    robot_serials_to_ignore: List[str] | None = Field(
+    robot_serials_to_ignore: Optional[List[str]] = Field(
         None,
         description="List of robot serial ids to ignore. If set to None, records all available robots.",
         examples=[["/dev/ttyUSB0"]],
+    )
+    enable_rerun_visualization: bool = Field(
+        False,
+        description="Enable rerun",
+    )
+    leader_arm_ids: Optional[List[str]] = Field(
+        None,
+        description="Serial numbers of the leader arms used during the recording",
+        examples=[["/dev/ttyUSB0"]],
+    )
+    save_cartesian: bool = Field(
+        False,
+        description="Record cartesian positions of the robots as well, this will make your dataset incompatible with lerobot and it only works for robots with simulators. Defaults to False.",
+    )
+    add_metadata: Optional[Dict[str, list]] = Field(
+        None,
+        description="Passing a dictionnary will store the value in each row of the recorded dataset. The key is the name of the column, and the value is a list. If set to None, no additional metadata is saved.",
+        examples=[{"bbox_position": [0.5, 1.0, 0.0, 0.5]}],
     )
 
 
@@ -530,11 +603,11 @@ class RecordingStopResponse(BaseModel):
     Response when the recording is stopped. The episode is saved in the given path.
     """
 
-    episode_folder_path: str | None = Field(
+    episode_folder_path: Optional[str] = Field(
         ...,
         description="Path to the folder where the episode is saved.",
     )
-    episode_index: int | None = Field(
+    episode_index: Optional[int] = Field(
         ...,
         description="Index of the recorded episode in the dataset.",
     )
@@ -549,18 +622,18 @@ class RecordingPlayRequest(BaseModel):
         "lerobot_v2.1",
         description="Format of the dataset to play. This is used to determine how to read the episode data.",
     )
-    dataset_name: str | None = Field(
+    dataset_name: Optional[str] = Field(
         None,
         description="Name of the dataset to play the episode from. If None, defaults to the last dataset recorded.",
         examples=["example_dataset"],
     )
-    episode_id: int | None = Field(
+    episode_id: Optional[int] = Field(
         None,
         description="ID of the episode to play. If a dataset_name is specified but episode_id is None, plays the last episode recorded of this dataset. "
         + "If dataset_name is None, this is ignored and plays the last episode recorded.",
         examples=[0],
     )
-    episode_path: str | None = Field(
+    episode_path: Optional[str] = Field(
         None,
         description="(Optional) If you recorded your data with LeRobot v2 compatible format, you can directly specifiy the path to the .parquet file of the episode to play. If specified, you don't have to pass a dataset_name or episode_id.",
         examples=[
@@ -568,12 +641,12 @@ class RecordingPlayRequest(BaseModel):
         ],
     )
 
-    robot_id: None | int | List[int] = Field(
+    robot_id: Optional[Union[int, List[int]]] = Field(
         None,
         description="ID of the robot to play the episode on. If None, plays on all robots. If a list, plays on the robots with the given IDs.",
         examples=[0, [0, 1]],
     )
-    robot_serials_to_ignore: List[str] | None = Field(
+    robot_serials_to_ignore: Optional[List[str]] = Field(
         None,
         description="List of robot serial ids to ignore. If set to None, plays on all available robots.",
         examples=[["/dev/ttyUSB0"]],
@@ -675,7 +748,7 @@ class DeleteEpisodeRequest(BaseModel):
     episode_id: int
 
 
-class ModelVideoKeysRequest(BaseModel):
+class ModelConfigurationRequest(BaseModel):
     model_id: str = Field(
         ...,
         description="Hugging Face model id to use",
@@ -683,17 +756,22 @@ class ModelVideoKeysRequest(BaseModel):
         # no empty string
         pattern=r"^\s*\S.*$",
     )
-    model_type: Literal["gr00t", "ACT", "ACT_BBOX"] = Field(
+    model_type: Literal["gr00t", "ACT", "ACT_BBOX", "pi0.5"] = Field(
         ...,
         description="Type of model to use.",
     )
 
 
-class ModelVideoKeysResponse(BaseModel):
+class ModelConfigurationResponse(BaseModel):
     video_keys: List[str] = Field(
         ...,
         description="List of video keys for the model. These are the keys used to access the videos in the dataset.",
         examples=[["video_0", "video_1"]],
+    )
+    checkpoints: List[str] = Field(
+        default_factory=list,
+        description="List of available checkpoints for the model.",
+        examples=[["100", "500"]],
     )
 
 
@@ -708,7 +786,8 @@ class AdminSettingsRequest(BaseModel):
     video_codec: VideoCodecs
     video_size: List[int]  # size 2
     task_instruction: str
-    cameras_to_record: List[int] | None = None
+    cameras_to_record: Optional[List[int]] = None
+    hf_private_mode: bool = False
 
 
 class AdminSettingsResponse(BaseModel):
@@ -722,7 +801,8 @@ class AdminSettingsResponse(BaseModel):
     video_codec: VideoCodecs
     video_size: List[int]  # size 2
     task_instruction: str
-    cameras_to_record: List[int] | None
+    cameras_to_record: Optional[List[int]]
+    hf_private_mode: bool
 
 
 class AdminSettingsTokenResponse(BaseModel):
@@ -786,12 +866,12 @@ class StartServerRequest(BaseModel):
     """
 
     model_id: str = Field(..., description="Hugging Face model id to use")
-    robot_serials_to_ignore: List[str] | None = Field(
+    robot_serials_to_ignore: Optional[List[str]] = Field(
         None,
         description="List of robot serial ids to ignore. If set to None, controls all available robots.",
         examples=[["/dev/ttyUSB0"]],
     )
-    model_type: Literal["gr00t", "ACT"] = Field(
+    model_type: Literal["gr00t", "ACT", "pi0.5"] = Field(
         ...,
         description="Type of model to use. Can be gr00t or act.",
     )
@@ -802,7 +882,9 @@ class StartAIControlRequest(BaseModel):
     Request to start the AI control of the robot.
     """
 
-    prompt: str | None = Field(None, description="Prompt to be followed by the robot")
+    prompt: Optional[str] = Field(
+        None, description="Prompt to be followed by the robot"
+    )
     model_id: str = Field(..., description="Hugging Face model id to use")
     speed: float = Field(
         1.0,
@@ -811,17 +893,17 @@ class StartAIControlRequest(BaseModel):
         description="Speed of the AI control. 1.0 is normal speed, 0.5 is half speed, 2.0 is double speed. The highest speed is still bottlenecked by the GPU inference time.",
     )
 
-    robot_serials_to_ignore: List[str] | None = Field(
+    robot_serials_to_ignore: Optional[List[str]] = Field(
         None,
         description="List of robot serial ids to ignore. If set to None, controls all available robots.",
         examples=[["/dev/ttyUSB0"]],
     )
-    cameras_keys_mapping: Dict[str, int] | None = Field(
+    cameras_keys_mapping: Optional[Dict[str, int]] = Field(
         None,
         description="Mapping of the camera keys to the camera ids. If set to None, use the default mapping based on cameras order.",
         examples=[{"wrist_camera": 0, "context_camera": 1}],
     )
-    model_type: Literal["gr00t", "ACT", "ACT_BBOX"] = Field(
+    model_type: Literal["gr00t", "ACT", "ACT_BBOX", "pi0.5"] = Field(
         ...,
         description="Type of model to use. Can be gr00t or act.",
     )
@@ -833,12 +915,40 @@ class StartAIControlRequest(BaseModel):
         True,
         description="Whether to verify the setup before starting the AI control. If False, skips the verification step.",
     )
-
-
-class AIStatusRequest(BaseModel):
-    user_id: str = Field(
-        ..., description="User ID of the user who started the AI control"
+    checkpoint: Optional[int] = Field(
+        None,
+        description="Checkpoint to use for the model. If None, uses the latest checkpoint.",
+        examples=[500],
     )
+    angle_format: Literal["degrees", "rad", "other"] = Field(
+        "rad",
+        description="Format of the angles used in the model. Can be 'degrees', 'radians', or 'other'. If other is selected, you will need to specify a min and max angle value.",
+        examples=["rad"],
+    )
+    min_angle: Optional[float] = Field(
+        None,
+        description="If angle_format is 'other', this is the minimum angle value used in the model. If None and angle_format is 'other', will raise an error.",
+    )
+    max_angle: Optional[float] = Field(
+        None,
+        description="If angle_format is 'other', this is the maximum angle value used in the model. If None and angle_format is 'other', will raise an error.",
+    )
+
+    @model_validator(mode="after")
+    def check_angle_format(self) -> "StartAIControlRequest":
+        """
+        Validate the angle format and min/max angles if angle_format is 'other'.
+        """
+        if self.angle_format == "other":
+            if self.min_angle is None or self.max_angle is None:
+                raise ValueError(
+                    "If angle_format is 'other', min_angle and max_angle must be set."
+                )
+            if self.min_angle >= self.max_angle:
+                raise ValueError(
+                    "min_angle must be less than max_angle when angle_format is 'other'."
+                )
+        return self
 
 
 class AIStatusResponse(BaseModel):
@@ -849,7 +959,7 @@ class AIStatusResponse(BaseModel):
     status: Literal["stopped", "running", "paused", "waiting"] = Field(
         ..., description="Status of the AI control"
     )
-    id: str | None = Field(..., description="ID of the AI control session.")
+    id: Optional[str] = Field(..., description="ID of the AI control session.")
 
 
 class TorqueControlRequest(BaseModel):
@@ -887,6 +997,11 @@ class LoginCredentialsRequest(BaseModel):
     password: str
 
 
+class VerifyEmailCodeRequest(BaseModel):
+    email: str
+    token: str
+
+
 class ConfirmRequest(BaseModel):
     access_token: str
     refresh_token: str
@@ -915,13 +1030,14 @@ class SessionReponse(BaseModel):
     """
 
     message: str
-    session: Session | None = None
-    is_pro_user: bool | None = None
+    session: Optional[Session] = None
+    is_pro_user: Optional[bool] = None
 
 
 class AuthResponse(BaseModel):
     authenticated: bool
-    session: Session | None = None
+    session: Optional[Session] = None
+    is_pro_user: Optional[bool] = None
 
 
 class FeedbackRequest(BaseModel):
@@ -940,12 +1056,14 @@ class RobotPairRequest(BaseModel):
     Represents a pair of robots for leader-follower control.
     """
 
-    leader_id: int | None = Field(..., description="Serial number of the leader robot")
-    follower_id: int | None = Field(
+    model_config = ConfigDict(extra="ignore")
+
+    leader_id: Optional[int] = Field(
+        ..., description="Serial number of the leader robot"
+    )
+    follower_id: Optional[int] = Field(
         ..., description="Serial number of the follower robot"
     )
-
-    model_config = ConfigDict(extra="ignore")
 
 
 class StartLeaderArmControlRequest(BaseModel):
@@ -966,7 +1084,7 @@ class StartLeaderArmControlRequest(BaseModel):
     enable_gravity_compensation: bool = Field(
         False, description="Enable gravity compensation for the leader robots"
     )
-    gravity_compensation_values: dict[str, int] | None = Field(
+    gravity_compensation_values: Optional[Dict[str, int]] = Field(
         {"shoulder": 100, "elbow": 50, "wrist": 10},
         description="Gravity compensation pourcentage values for shoulder, elbow, and wrist joints (0-100%)",
     )
@@ -981,14 +1099,17 @@ class SupabaseTrainingModel(BaseModel):
     dataset_name: str
     model_name: str
     requested_at: str
-    terminated_at: str | None
-    used_wandb: bool | None
+    terminated_at: Optional[str]
+    used_wandb: Optional[bool]
     model_type: str
-    training_params: dict | None = None
-    modal_function_call_id: str | None = None
+    training_params: Optional[dict] = None
+    modal_function_call_id: Optional[str] = None
+    # Metrics
+    session_count: int = 0
+    success_rate: Optional[float] = None
 
 
-class TrainingConfig(BaseModel):
+class TrainingsList(BaseModel):
     models: list[SupabaseTrainingModel]
 
 
@@ -998,9 +1119,13 @@ class UDPServerInformationResponse(BaseModel):
 
 
 class StartTrainingResponse(StatusResponse):
-    training_id: int | None = Field(
+    training_id: Optional[int] = Field(
         ...,
         description="ID of the training to start. This is the ID returned by the training request.",
+    )
+    model_url: Optional[str] = Field(
+        None,
+        description="URL to the Hugging Face model card.",
     )
 
 
@@ -1020,7 +1145,7 @@ class ScanNetworkRequest(BaseModel):
     Request to scan the network for devices.
     """
 
-    robot_name: str | None = Field(
+    robot_name: Optional[str] = Field(
         None,
         description="Name of the robot to scan for. If None, scans for all devices on the network.",
     )
@@ -1035,7 +1160,7 @@ class ScanNetworkResponse(BaseModel):
         ...,
         description="List of devices found on the network.",
     )
-    subnet: str | None = Field(
+    subnet: Optional[str] = Field(
         ...,
         description="Subnet of the network.",
         examples=["192.168.1.1/24"],
@@ -1045,9 +1170,9 @@ class ScanNetworkResponse(BaseModel):
 class LocalDevice(BaseModel):
     name: str
     device: str
-    serial_number: str | None = None
-    pid: int | None = None
-    interface: str | None = None
+    serial_number: Optional[str] = None
+    pid: Optional[int] = None
+    interface: Optional[str] = None
 
 
 class ScanDevicesResponse(BaseModel):
@@ -1074,4 +1199,88 @@ class RobotConnectionRequest(BaseModel):
     connection_details: dict[str, Any] = Field(
         ...,
         description="Connection details for the robot. These are passed to the class constructor. This can include IP address, port, and other connection parameters.",
+    )
+
+
+class RobotConnectionResponse(StatusResponse):
+    robot_id: int
+
+
+class AddZMQCameraRequest(BaseModel):
+    """
+    Request model for adding a ZMQ camera feed.
+    """
+
+    tcp_address: str = Field(
+        ...,
+        description="TCP address of the ZMQ publisher. "
+        + "Format: 'tcp://<host>:<port>'.",
+        examples=["tcp://localhost:5555"],
+    )
+    topic: Optional[str] = Field(
+        None,
+        description="Topic to subscribe to. If None, will subscribes to all messages on the given TCP address.",
+        examples=["cabin_view", "wrist_camera"],
+    )
+
+
+class TeleopSettings(BaseModel):
+    """
+    Model representing current teleop settings.
+    """
+
+    vr_scaling: float = Field(
+        ...,
+        description="VR scaling factor for teleoperation control.",
+        gt=0,
+        examples=[1.0, 0.5, 2.0],
+    )
+
+
+class TeleopSettingsRequest(BaseModel):
+    """
+    Request model for updating teleop settings.
+    """
+
+    vr_scaling: float = Field(
+        ...,
+        description="VR scaling factor for teleoperation control.",
+        gt=0,
+        examples=[1.0, 0.5, 2.0],
+    )
+
+
+class ChatRequest(BaseModel):
+    """
+    Control the robot with a natural language prompt.
+    """
+
+    chat_id: str = Field(
+        default_factory=lambda: str(uuid.uuid4()),
+        description="Unique identifier for the chat session. If not provided, a new UUID will be generated.",
+    )
+    prompt: str = Field(
+        ...,
+        description="The task to be performed by the robot, described in natural language.",
+    )
+    images: Optional[List[str]] = Field(
+        None, description="base64 encoded images to be sent with the request. "
+    )
+    command_history: Optional[List[str]] = Field(
+        None, description="List of previous commands to provide context for the chat."
+    )
+
+
+class ChatResponse(BaseModel):
+    """
+    Response to the chat request.
+    """
+
+    command: Optional[str] = Field(
+        ...,
+        description="The command to be executed by the robot, generated from the prompt.",
+    )
+    endpoint: Optional[str] = Field(None, description="The endpoint to call.")
+    endpoint_params: Optional[Dict[str, Any]] = Field(
+        None, description="Parameters to pass to the endpoint."
     )

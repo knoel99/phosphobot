@@ -7,7 +7,7 @@ const PHOSPHO_PRO_SUBSCRIBE_URL = "https://phospho.ai/pro";
 
 export function PhosphoProCallout({ className }: { className?: string }) {
   return (
-    <Card className={cn("border-green-400 py-2 px-4", className)}>
+    <Card className={cn("border-green-500 border-2 py-2 px-4", className)}>
       <CardContent className="flex items-center p-2">
         <div className="flex flex-row justify-between items-center gap-4 w-full">
           <div>
@@ -19,8 +19,8 @@ export function PhosphoProCallout({ className }: { className?: string }) {
               <span className="text-green-500">phospho pro</span>
             </div>
             <div className="mb-3 text-muted-foreground">
-              Access the phospho teleoperation app, AI training, exclusive
-              Discord channels and more...
+              Control your robot in VR, unlock advanced AI training, access
+              exclusive Discord channels, and more.
             </div>
           </div>
           <div className="flex-shrink-0">
@@ -39,5 +39,3 @@ export function PhosphoProCallout({ className }: { className?: string }) {
     </Card>
   );
 }
-
-export default PhosphoProCallout;

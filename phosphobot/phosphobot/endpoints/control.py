@@ -1,12 +1,13 @@
 import asyncio
-import datetime
 import json
+import traceback
 from copy import copy
-from typing import Literal, cast
+from typing import Optional, cast
 
+import httpx
 import json_numpy  # type: ignore
 import numpy as np
-from dateutil import parser  # type: ignore
+import serial
 from fastapi import (
     APIRouter,
     BackgroundTasks,
@@ -17,31 +18,38 @@ from fastapi import (
 )
 from loguru import logger
 from scipy.spatial.transform import Rotation as R
+from supabase_auth.types import Session as SupabaseSession
 
 from phosphobot.ai_control import CustomAIControlSignal, setup_ai_control
 from phosphobot.camera import AllCameras, get_all_cameras
 from phosphobot.control_signal import ControlSignal
 from phosphobot.hardware.base import BaseManipulator
-from phosphobot.leader_follower import RobotPair, leader_follower_loop
+from phosphobot.leader_follower import RobotPair, start_leader_follower_loop
 from phosphobot.models import (
     AIControlStatusResponse,
-    AIStatusRequest,
     AIStatusResponse,
     AppControlData,
     CalibrateResponse,
     EndEffectorPosition,
+    EndEffectorReadRequest,
     FeedbackRequest,
     JointsReadRequest,
     JointsReadResponse,
     JointsWriteRequest,
     MoveAbsoluteRequest,
     RelativeEndEffectorPosition,
+    RobotConfigResponse,
     RobotConnectionRequest,
+    RobotConnectionResponse,
     SpawnStatusResponse,
     StartAIControlRequest,
     StartLeaderArmControlRequest,
     StartServerRequest,
     StatusResponse,
+    TeleopSettings,
+    TeleopSettingsRequest,
+    TemperatureReadResponse,
+    TemperatureWriteRequest,
     TorqueControlRequest,
     TorqueReadResponse,
     UDPServerInformationResponse,
@@ -51,7 +59,6 @@ from phosphobot.robot import (
     RemotePhosphobot,
     RobotConnectionManager,
     SO100Hardware,
-    PiperHardware,
     get_rcm,
 )
 from phosphobot.supabase import get_client, user_is_logged_in
@@ -61,7 +68,7 @@ from phosphobot.teleoperation import (
     get_teleop_manager,
     get_udp_server,
 )
-from phosphobot.utils import background_task_log_exceptions
+from phosphobot.utils import background_task_log_exceptions, get_tokens
 
 # This is used to send numpy arrays as JSON to OpenVLA server
 json_numpy.patch()
@@ -70,10 +77,10 @@ router = APIRouter(tags=["control"])
 
 
 # Object that controls the global /auto, /gravity state in a thread safe way
-ai_control_signal = CustomAIControlSignal()
-gravity_control = ControlSignal()
-leader_follower_control = ControlSignal()
-vr_control_signal = ControlSignal()
+signal_ai_control = CustomAIControlSignal()
+signal_gravity_control = ControlSignal()
+signal_leader_follower = ControlSignal()
+signal_vr_control = ControlSignal()
 
 
 @router.post(
@@ -83,9 +90,9 @@ vr_control_signal = ControlSignal()
     description="Initialize the robot to its initial position before starting the teleoperation.",
 )
 async def move_init(
-    robot_id: int | None = None,
+    robot_id: Optional[int] = None,
     teleop_manager: TeleopManager = Depends(get_teleop_manager),
-):
+) -> StatusResponse:
     """
     Initialize the robot to its initial position before starting the teleoperation.
     """
@@ -101,7 +108,7 @@ async def move_init(
 )
 async def move_teleop_post(
     control_data: AppControlData,
-    robot_id: int | None = None,
+    robot_id: Optional[int] = None,
     teleop_manager: TeleopManager = Depends(get_teleop_manager),
 ) -> StatusResponse:
     teleop_manager.robot_id = robot_id
@@ -115,7 +122,7 @@ async def move_teleop_ws(
     websocket: WebSocket,
     rcm: RobotConnectionManager = Depends(get_rcm),
     teleop_manager: TeleopManager = Depends(get_teleop_manager),
-):
+) -> None:
     teleop_manager.robot_id = None
 
     if not await rcm.robots:
@@ -123,7 +130,7 @@ async def move_teleop_ws(
 
     await websocket.accept()
 
-    vr_control_signal.start()
+    signal_vr_control.start()
     try:
         while True:
             data = await websocket.receive_text()
@@ -137,14 +144,14 @@ async def move_teleop_ws(
     except WebSocketDisconnect:
         logger.warning("WebSocket client disconnected")
 
-    vr_control_signal.stop()
+    signal_vr_control.stop()
 
 
 @router.post("/move/teleop/udp", response_model=UDPServerInformationResponse)
 async def move_teleop_udp(
     udp_server: UDPServer = Depends(get_udp_server),
     teleop_manager: TeleopManager = Depends(get_teleop_manager),
-):
+) -> UDPServerInformationResponse:
     """
     Start a UDP server to send and receive teleoperation data to the robot.
     """
@@ -156,7 +163,7 @@ async def move_teleop_udp(
 @router.post("/move/teleop/udp/stop", response_model=StatusResponse)
 async def stop_teleop_udp(
     udp_server: UDPServer = Depends(get_udp_server),
-):
+) -> StatusResponse:
     """
     Stop the UDP server main loop.
     """
@@ -220,11 +227,6 @@ async def move_to_absolute_position(
             if robot.name == "so100":
                 # We invert rx and ry
                 target_controller_orientation = np.array([query.ry, query.rx, query.rz])
-            elif robot.name == "agilex-piper":
-                rotation = R.from_euler("y", -90, degrees=True)
-                target_controller_orientation = rotation.apply(
-                    [query.rx, query.ry, query.rz]
-                )
             else:
                 target_controller_orientation = np.array([query.rx, query.ry, query.rz])
 
@@ -249,7 +251,7 @@ async def move_to_absolute_position(
         else:
             orientation_residual = 0
 
-        async def try_moving_to_target():
+        async def try_moving_to_target() -> None:
             nonlocal \
                 current_position, \
                 current_orientation, \
@@ -268,13 +270,12 @@ async def move_to_absolute_position(
                 await robot.move_robot_absolute(
                     target_position=target_position,
                     target_orientation_rad=target_orientation_rad,
-                    interpolate_trajectory=False,
                 )
                 current_position, current_orientation = robot.forward_kinematics()
                 position_residual = np.linalg.norm(current_position - target_position)
                 if use_angles:
-                    orientation_residual = np.linalg.norm(
-                        current_orientation - target_orientation_rad
+                    orientation_residual = float(
+                        np.linalg.norm(current_orientation - target_orientation_rad)
                     )
 
         await try_moving_to_target()
@@ -367,7 +368,6 @@ async def move_relative(
                 detail=f"Robot {robot.name} .move_to_initial_position() did not set initial position or orientation: {initial_position=}, {initial_orientation_rad=}",
             )
 
-    logger.info(f"Received relative data: {data}")
     delta_position = np.array([data.x, data.y, data.z])
     delta_orientation_euler_degrees = np.array([data.rx, data.ry, data.rz])
     open = data.open if data.open is not None else None
@@ -395,10 +395,6 @@ async def move_relative(
     # Round to 3 decimals
     target_position = np.round(target_position, 3)
     target_orientation = np.round(target_orientation, 3)
-
-    logger.info(
-        f"Target position: {target_position}. Target orientation: {target_orientation}"
-    )
 
     await move_to_absolute_position(
         query=MoveAbsoluteRequest(
@@ -479,6 +475,7 @@ async def move_sleep(
     description="Retrieve the position, orientation, and open status of the robot's end effector. Only available for manipulators.",
 )
 async def end_effector_read(
+    query: Optional[EndEffectorReadRequest] = None,
     robot_id: int = 0,
     rcm: RobotConnectionManager = Depends(get_rcm),
 ) -> EndEffectorPosition:
@@ -486,6 +483,8 @@ async def end_effector_read(
     Get the position, orientation, and open status of the end effector.
     """
     robot = await rcm.get_robot(robot_id)
+    if query is None:
+        query = EndEffectorReadRequest(only_gripper=False, sync=False)
 
     if not isinstance(robot, BaseManipulator):
         raise HTTPException(
@@ -493,15 +492,31 @@ async def end_effector_read(
             detail="Robot is not a manipulator and does not have an end effector",
         )
 
+    if query.only_gripper:
+        if not hasattr(robot, "closing_gripper_value"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Robot {robot.name} does not have a .closing_gripper_value attribute to read the gripper state.",
+            )
+        return EndEffectorPosition(
+            x=None,
+            y=None,
+            z=None,
+            rx=None,
+            ry=None,
+            rz=None,
+            open=robot.closing_gripper_value,
+        )
+
     initial_position = getattr(robot, "initial_position", None)
     initial_orientation_rad = getattr(robot, "initial_orientation_rad", None)
     if initial_position is None or initial_orientation_rad is None:
         raise HTTPException(
             status_code=400,
-            detail=f"Call /move/init before using this endpoint for robot {robot.name}. ",
+            detail=f"Before using /end-effector/read you need to call /move/init?robot_id={robot_id} to initialize the robot's position and orientation.",
         )
 
-    position, orientation, open_status = robot.get_end_effector_state()
+    position, orientation, open_status = robot.get_end_effector_state(sync=query.sync)
     # Remove the initial position and orientation (used to zero the robot)
     position = position - initial_position
     orientation = orientation - initial_orientation_rad
@@ -529,7 +544,7 @@ async def end_effector_read(
 async def read_voltage(
     robot_id: int = 0,
     rcm: RobotConnectionManager = Depends(get_rcm),
-):
+) -> VoltageReadResponse:
     """
     Read voltage of the robot.
     """
@@ -547,6 +562,59 @@ async def read_voltage(
 
 
 @router.post(
+    "/temperature/read",
+    response_model=TemperatureReadResponse,
+    summary="Read Temperature",
+    description="Read the current Temperature and maximum Temperature of the robot's motors.",
+)
+async def read_temperature(
+    robot_id: int = 0,
+    rcm: RobotConnectionManager = Depends(get_rcm),
+) -> TemperatureReadResponse:
+    """
+    Read temperature of the robot.
+    """
+    robot = await rcm.get_robot(robot_id)
+    if not hasattr(robot, "current_temperature"):
+        raise HTTPException(
+            status_code=400,
+            detail="Robot does not support reading temperature",
+        )
+
+    temperature = robot.current_temperature()
+
+    return TemperatureReadResponse(
+        current_max_Temperature=temperature,
+    )
+
+
+@router.post(
+    "/temperature/write",
+    response_model=StatusResponse,
+    summary="Write the Maximum Temperature for Joints",
+    description="Set the robot's maximum temperature for motors..",
+)
+async def write_temperature(
+    request: TemperatureWriteRequest,
+    robot_id: int = 0,
+    rcm: RobotConnectionManager = Depends(get_rcm),
+) -> StatusResponse:
+    """
+    Set the robot's maximum temperature for motors.
+    """
+    robot = await rcm.get_robot(robot_id)
+    if not hasattr(robot, "set_maximum_temperature"):
+        raise HTTPException(
+            status_code=400,
+            detail="Robot does not support setting motor temperature",
+        )
+    robot.set_maximum_temperature(
+        maximum_temperature_target=request.maximum_temperature
+    )
+    return StatusResponse()
+
+
+@router.post(
     "/torque/read",
     response_model=TorqueReadResponse,
     summary="Read Torque",
@@ -555,7 +623,7 @@ async def read_voltage(
 async def read_torque(
     robot_id: int = 0,
     rcm: RobotConnectionManager = Depends(get_rcm),
-):
+) -> TorqueReadResponse:
     """
     Read torque of the robot.
     """
@@ -585,7 +653,7 @@ async def read_torque(
 )
 async def toggle_torque(
     request: TorqueControlRequest,
-    robot_id: int | None = None,
+    robot_id: Optional[int] = None,
     rcm: RobotConnectionManager = Depends(get_rcm),
 ) -> StatusResponse:
     """
@@ -630,7 +698,7 @@ async def toggle_torque(
     description="Read the current positions of the robot's joints in radians and motor units.",
 )
 async def read_joints(
-    request: JointsReadRequest | None = None,
+    request: Optional[JointsReadRequest] = None,
     robot_id: int = 0,
     rcm: RobotConnectionManager = Depends(get_rcm),
 ) -> JointsReadResponse:
@@ -638,7 +706,7 @@ async def read_joints(
     Read joint position.
     """
     if request is None:
-        request = JointsReadRequest(unit="rad", joints_ids=None)
+        request = JointsReadRequest(unit="rad", joints_ids=None, source="robot")
 
     robot = await rcm.get_robot(robot_id)
 
@@ -649,7 +717,7 @@ async def read_joints(
         )
 
     current_units_position = robot.read_joints_position(
-        unit=request.unit, joints_ids=request.joints_ids
+        unit=request.unit, joints_ids=request.joints_ids, source=request.source
     )
     # Replace NaN values with None and convert to list
     current_units_position = [
@@ -758,10 +826,10 @@ async def start_leader_follower(
     The first robot is the leader with gravity compensation enabled,
     and the second robot follows the leader's joint positions.
     """
-    if leader_follower_control.is_in_loop():
+    if signal_leader_follower.is_in_loop():
         raise HTTPException(
             status_code=400,
-            detail="Leader-follower control is already running. Call /move/leader/stop first.",
+            detail="Leader-follower control is already running. To stop it, call /move/leader/stop",
         )
 
     # Parse the robot IDs from the request
@@ -793,11 +861,7 @@ async def start_leader_follower(
                     detail=f"Follower must be an instance of SO100Hardware for robot pair {i}.",
                 )
         else:
-            valid_robot_types = (
-                SO100Hardware,
-                PiperHardware,
-                RemotePhosphobot,
-            )
+            valid_robot_types = (BaseManipulator, RemotePhosphobot)
             if not isinstance(leader, valid_robot_types):
                 raise HTTPException(
                     status_code=400,
@@ -813,13 +877,13 @@ async def start_leader_follower(
         robot_pairs.append(RobotPair(leader=leader, follower=follower))
 
     # Create control signal for managing the leader-follower operation
-    leader_follower_control.start()
+    signal_leader_follower.start()
 
     # Add background task to run the control loop
     background_tasks.add_task(
-        background_task_log_exceptions(leader_follower_loop),
+        start_leader_follower_loop,
         robot_pairs=robot_pairs,
-        control_signal=leader_follower_control,
+        control_signal=signal_leader_follower,
         invert_controls=request.invert_controls,
         enable_gravity_compensation=request.enable_gravity_compensation,
         compensation_values=request.gravity_compensation_values,
@@ -840,12 +904,12 @@ async def stop_leader_follower(
     """
     Stop the leader-follower
     """
-    if not leader_follower_control.is_in_loop():
+    if not signal_leader_follower.is_in_loop():
         return StatusResponse(
             status="error", message="Leader-follower control is not running"
         )
 
-    leader_follower_control.stop()
+    signal_leader_follower.stop()
     return StatusResponse(message="Stopping leader-follower control")
 
 
@@ -858,7 +922,7 @@ async def start_gravity(
     """
     Enable gravity compensation for the robot.
     """
-    if gravity_control.is_in_loop():
+    if signal_gravity_control.is_in_loop():
         raise HTTPException(
             status_code=400, detail="Gravity control is already running"
         )
@@ -872,12 +936,12 @@ async def start_gravity(
             status_code=400, detail="Gravity compensation is only for SO-100 robot"
         )
 
-    gravity_control.start()
+    signal_gravity_control.start()
 
     # Add background task to run the control loop
     background_tasks.add_task(
         background_task_log_exceptions(robot.gravity_compensation_loop),
-        control_signal=gravity_control,
+        control_signal=signal_gravity_control,
     )
     return StatusResponse()
 
@@ -894,10 +958,10 @@ async def stop_gravity_compensation(
     """
     Stop the gravity compensation for all robots.
     """
-    if not gravity_control.is_in_loop():
+    if not signal_gravity_control.is_in_loop():
         return StatusResponse(status="error", message="Gravity control is not running")
 
-    gravity_control.stop()
+    signal_gravity_control.stop()
     return StatusResponse(message="Stopping gravity control")
 
 
@@ -907,88 +971,11 @@ async def stop_gravity_compensation(
     summary="Get the status of the auto control by AI",
     description="Get the status of the auto control by AI.",
 )
-async def fetch_auto_control_status(request: AIStatusRequest) -> AIStatusResponse:
+async def fetch_auto_control_status() -> AIStatusResponse:
     """
     Fetch the status of the auto control by AI
     """
-    supabase_id: str | None = None
-    supabase_status: Literal["stopped", "running", "paused", "waiting"] | None = None
-
-    supabase_client = await get_client()
-    try:
-        user = await supabase_client.auth.get_user()
-    except Exception as e:
-        logger.warning(f"Failed to loggin: {e}")
-        raise HTTPException(status_code=401, detail="Not authenticated")
-
-    if user is not None:
-        supabase_response = (
-            await supabase_client.table("ai_control_sessions")
-            .select("*, servers(status)")
-            .eq("user_id", user.user.id)
-            .order("created_at", desc=True)
-            .limit(1)
-            .execute()
-        )
-        if supabase_response.data:
-            supabase_data = supabase_response.data[0]
-            supabase_id = supabase_data["id"]
-            supabase_status = supabase_data["status"]
-            # If server status is stopped, set status to stopped
-            if (
-                supabase_data["servers"] is not None
-                and supabase_data["servers"]["status"] == "stopped"
-            ):
-                # Set the backend status to stopped
-                supabase_status = "stopped"
-                # Update the status in the database
-                await (
-                    supabase_client.table("ai_control_sessions")
-                    .update({"status": supabase_status})
-                    .eq("id", supabase_id)
-                    .execute()
-                )
-            # If ai-control signal is stopped but remote status is running, set the remote status to stopped
-            if ai_control_signal.status == "stopped" and supabase_status == "running":
-                supabase_status = "stopped"
-                # Update the status in the database
-                await (
-                    supabase_client.table("ai_control_sessions")
-                    .update({"status": supabase_status})
-                    .eq("id", supabase_id)
-                    .execute()
-                )
-
-    # Situation 1: There is already a different, running process in backend
-    if (
-        supabase_id is not None
-        and supabase_id != ai_control_signal.id
-        and (
-            supabase_status == "running"
-            or supabase_status == "paused"
-            or supabase_status == "waiting"
-        )
-    ):
-        # if started less than 10 minutes ago, return the backend status
-        created_at = parser.isoparse(supabase_data["created_at"])
-        if (
-            datetime.datetime.now(datetime.timezone.utc) - created_at
-        ).total_seconds() < 600:
-            ai_control_signal.id = supabase_id
-            return AIStatusResponse(id=supabase_id, status=supabase_status)
-
-    # Situation 2: The backend says the process should be waiting or stopped
-    if (
-        supabase_id is not None
-        and supabase_id == ai_control_signal.id
-        and supabase_status == "stopped"
-    ):
-        # Stop the local process
-        ai_control_signal.status = supabase_status
-        return AIStatusResponse(id=supabase_id, status=supabase_status)
-
-    # Situation 3: return the current local status
-    return AIStatusResponse(id=ai_control_signal.id, status=ai_control_signal.status)
+    return AIStatusResponse(id=signal_ai_control.id, status=signal_ai_control.status)
 
 
 @router.post(
@@ -1001,7 +988,7 @@ async def spawn_inference_server(
     query: StartServerRequest,
     rcm: RobotConnectionManager = Depends(get_rcm),
     all_cameras: AllCameras = Depends(get_all_cameras),
-    session=Depends(user_is_logged_in),
+    session: SupabaseSession = Depends(user_is_logged_in),
 ) -> SpawnStatusResponse:
     """
     Start an inference server and return the server info.
@@ -1035,7 +1022,7 @@ async def spawn_inference_server(
         model_id=query.model_id,
         init_connected_robots=False,
         model_type=query.model_type,
-        ai_control_signal_id=ai_control_signal.id,
+        ai_control_signal_id=signal_ai_control.id,
     )
 
     return SpawnStatusResponse(message="ok", server_info=server_info)
@@ -1047,27 +1034,39 @@ async def spawn_inference_server(
     summary="Start the auto control by AI",
     description="Start the auto control by AI.",
 )
-async def start_auto_control(
+async def start_ai_control(
     query: StartAIControlRequest,
     background_tasks: BackgroundTasks,
     rcm: RobotConnectionManager = Depends(get_rcm),
     all_cameras: AllCameras = Depends(get_all_cameras),
-    session=Depends(user_is_logged_in),
+    session: SupabaseSession = Depends(user_is_logged_in),
 ) -> AIControlStatusResponse:
     """
     Start the auto control by AI
     """
-    if ai_control_signal.is_in_loop():
+
+    if signal_leader_follower.is_in_loop():
+        raise HTTPException(
+            status_code=400,
+            detail="Leader-follower control is running. Stop it before starting AI control.",
+        )
+    if signal_gravity_control.is_in_loop():
+        raise HTTPException(
+            status_code=400,
+            detail="Gravity compensation is running. Stop it before starting AI control.",
+        )
+
+    if signal_ai_control.is_in_loop():
         return AIControlStatusResponse(
             status="error",
             message="Auto control is already running",
-            ai_control_signal_id=ai_control_signal.id,
-            ai_control_signal_status=ai_control_signal.status,
+            ai_control_signal_id=signal_ai_control.id,
+            ai_control_signal_status=signal_ai_control.status,
             server_info=None,
         )
 
-    ai_control_signal.new_id()
-    ai_control_signal.start()
+    signal_ai_control.new_id()
+    signal_ai_control.start()
 
     supabase_client = await get_client()
     user = await supabase_client.auth.get_user()
@@ -1077,12 +1076,13 @@ async def start_auto_control(
         supabase_client.table("ai_control_sessions")
         .upsert(
             {
-                "id": ai_control_signal.id,
+                "id": signal_ai_control.id,
                 "user_id": user.user.id,
                 "user_email": user.user.email,
                 "model_type": query.model_type,
                 "model_id": query.model_id,
                 "prompt": query.prompt,
+                "checkpoint": query.checkpoint,
                 "status": "waiting",
             }
         )
@@ -1114,8 +1114,9 @@ async def start_auto_control(
         model_type=query.model_type,
         model_id=query.model_id,
         cameras_keys_mapping=query.cameras_keys_mapping,
-        ai_control_signal_id=ai_control_signal.id,
+        ai_control_signal_id=signal_ai_control.id,
         verify_cameras=query.verify_cameras,
+        checkpoint=query.checkpoint,
     )
 
     # Add a flag: successful setup
@@ -1127,14 +1128,14 @@ async def start_auto_control(
                 "server_id": server_info.server_id,
             }
         )
-        .eq("id", ai_control_signal.id)
+        .eq("id", signal_ai_control.id)
         .execute()
     )
 
     background_tasks.add_task(
         model.control_loop,
         robots=robots_to_control,
-        control_signal=ai_control_signal,
+        control_signal=signal_ai_control,
         prompt=query.prompt,
         all_cameras=all_cameras,
         model_spawn_config=model_spawn_config,
@@ -1142,13 +1143,16 @@ async def start_auto_control(
         cameras_keys_mapping=query.cameras_keys_mapping,
         detect_instruction=query.prompt,
         selected_camera_id=query.selected_camera_id,
+        angle_format=query.angle_format,
+        min_angle=query.min_angle,
+        max_angle=query.max_angle,
     )
 
     return AIControlStatusResponse(
         status="ok",
-        message=f"Starting AI control with id: {ai_control_signal.id}",
+        message=f"Starting AI control with id: {signal_ai_control.id}",
         server_info=server_info,
-        ai_control_signal_id=ai_control_signal.id,
+        ai_control_signal_id=signal_ai_control.id,
         ai_control_signal_status="waiting",
     )
 
@@ -1159,17 +1163,37 @@ async def start_auto_control(
     summary="Stop the auto control by AI",
     description="Stop the auto control by AI.",
 )
-async def stop_auto_control(
+async def stop_ai_control(
+    background_tasks: BackgroundTasks,
     rcm: RobotConnectionManager = Depends(get_rcm),
+    session: SupabaseSession = Depends(user_is_logged_in),
 ) -> StatusResponse:
     """
     Stop the auto control by AI
     """
-    if not ai_control_signal.is_in_loop():
+
+    tokens = get_tokens()
+
+    # Call the /stop endpoint in Modal
+    @background_task_log_exceptions
+    async def stop_modal() -> None:
+        async with httpx.AsyncClient(timeout=5) as client:
+            await client.post(
+                url=f"{tokens.MODAL_API_URL}/stop",
+                headers={
+                    "Authorization": f"Bearer {session.access_token}",
+                    "Content-Type": "application/json",
+                },
+            )
+
+    background_tasks.add_task(stop_modal)
+
+    if not signal_ai_control.is_in_loop():
         return StatusResponse(message="Auto control is not running")
 
-    ai_control_signal.stop()
-    return StatusResponse(message="Stopping auto control")
+    signal_ai_control.stop()
+
+    return StatusResponse(message="Stopped AI control")
 
 
 @router.post(
@@ -1178,17 +1202,17 @@ async def stop_auto_control(
     summary="Pause the auto control by AI",
     description="Pause the auto control by AI.",
 )
-async def pause_auto_control(
+async def pause_ai_control(
     rcm: RobotConnectionManager = Depends(get_rcm),
 ) -> StatusResponse:
     """
     Pause the auto control by AI
     """
-    if not ai_control_signal.is_in_loop():
+    if not signal_ai_control.is_in_loop():
         return StatusResponse(message="Auto control is not running")
 
-    ai_control_signal.status = "paused"
-    return StatusResponse(message="Pausing auto control")
+    signal_ai_control.status = "paused"
+    return StatusResponse(message="Pausing AI control")
 
 
 @router.post(
@@ -1197,40 +1221,33 @@ async def pause_auto_control(
     summary="Resume the auto control by AI",
     description="Resume the auto control by AI.",
 )
-async def resume_auto_control(
+async def resume_ai_control(
     rcm: RobotConnectionManager = Depends(get_rcm),
 ) -> StatusResponse:
     """
     Resume the auto control by AI
     """
-    if ai_control_signal.status == "running":
-        return StatusResponse(message="Auto control is already running")
+    if signal_ai_control.status == "running":
+        return StatusResponse(message="AI control is already running")
 
-    ai_control_signal.status = "running"
-    return StatusResponse(message="Resuming auto control")
+    signal_ai_control.status = "running"
+    return StatusResponse(message="Resuming AI control")
 
 
 @router.post(
     "/ai-control/feedback",
     response_model=StatusResponse,
-    summary="Feedback about the auto control session",
+    summary="Feedback about the AI control session",
 )
-async def feedback_auto_control(
+async def feedback_ai_control(
     request: FeedbackRequest,
-    session=Depends(user_is_logged_in),
+    session: SupabaseSession = Depends(user_is_logged_in),
 ) -> StatusResponse:
-    """
-    Feedback about the auto control session
-    """
     supabase_client = await get_client()
 
     await (
         supabase_client.table("ai_control_sessions")
-        .update(
-            {
-                "feedback": request.feedback,
-            }
-        )
+        .update({"feedback": request.feedback})
         .eq("id", request.ai_control_id)
         .execute()
     )
@@ -1238,9 +1255,59 @@ async def feedback_auto_control(
     return StatusResponse(message="Feedback sent")
 
 
-@router.post("/robot/add-connection", response_model=StatusResponse)
+@router.post("/robot/add-connection", response_model=RobotConnectionResponse)
 async def add_robot_connection(
     query: RobotConnectionRequest,
+    rcm: RobotConnectionManager = Depends(get_rcm),
+) -> RobotConnectionResponse:
+    """
+    Manually add a robot connection to the robot manager.
+    Useful for adding robot that are accessible only via WiFi, for example.
+    """
+    try:
+        robot_id, robot = await rcm.add_connection(
+            robot_name=query.robot_name,
+            connection_details=query.connection_details,
+        )
+        return RobotConnectionResponse(
+            status="ok",
+            message=f"Robot connection to {query.robot_name} added",
+            robot_id=robot_id,
+        )
+    except serial.SerialException as e:
+        if "Access is denied" in str(e):
+            logger.warning(
+                f"Failed to add robot connection: {e}\n{traceback.format_exc()}"
+            )
+            raise HTTPException(
+                status_code=403,
+                detail=f"Permission error: {e}. If you're on Windows, try running with WSL (Windows Subsystem for Linux) or phosphobot has the authorization to use the serial port.",
+            )
+        elif "Permission denied" in str(e):
+            logger.warning(
+                f"Failed to add robot connection: {e}\n{traceback.format_exc()}"
+            )
+            raise HTTPException(
+                status_code=403,
+                detail=f"Permission denied: {e}. If you're on Linux, try running phosphobot as sudo (`sudo phosphobot`) and ensure that your user has access to the serial port.",
+            )
+        else:
+            logger.error(
+                f"Failed to add robot connection (SerialException): {e}\n{traceback.format_exc()}"
+            )
+            raise HTTPException(
+                status_code=400, detail=f"Failed to add robot connection: {e}"
+            )
+    except Exception as e:
+        logger.error(f"Failed to add robot connection: {e}\n{traceback.format_exc()}")
+        raise HTTPException(
+            status_code=400, detail=f"Failed to add robot connection: {e}"
+        )
+
+
+@router.post("/robot/disconnect", response_model=StatusResponse)
+async def disconnect_robot(
+    robot_id: int = 0,
     rcm: RobotConnectionManager = Depends(get_rcm),
 ) -> StatusResponse:
     """
@@ -1248,15 +1315,85 @@ async def add_robot_connection(
     Useful for adding robot that are accessible only via WiFi, for example.
     """
     try:
-        await rcm.add_connection(
-            robot_name=query.robot_name,
-            connection_details=query.connection_details,
-        )
+        await rcm.remove_connection(robot_id=robot_id)
         return StatusResponse(
-            status="ok", message=f"Robot connection to {query.robot_name} added"
+            status="ok",
+            message=f"Robot connection to {robot_id} removed successfully",
         )
+    except HTTPException as e:
+        raise e
     except Exception as e:
-        logger.error(f"Failed to add robot connection: {e}")
-        raise HTTPException(
-            status_code=400, detail=f"Failed to add robot connection: {e}"
+        logger.error(
+            f"Failed to remove robot connection {robot_id}: {e}\n{traceback.format_exc()}"
         )
+        raise HTTPException(
+            status_code=400, detail=f"Failed to remove robot connection {robot_id}: {e}"
+        )
+
+
+@router.post("/robot/config", response_model=RobotConfigResponse)
+async def get_robot_config(
+    robot_id: int = 0,
+    rcm: RobotConnectionManager = Depends(get_rcm),
+) -> RobotConfigResponse:
+    """
+    Get the configuration of the robot.
+    """
+    robot = await rcm.get_robot(robot_id)
+
+    if isinstance(robot, BaseManipulator) or isinstance(robot, RemotePhosphobot):
+        config = robot.config
+        return RobotConfigResponse(
+            robot_id=robot_id,
+            name=robot.name,
+            config=config,
+            gripper_joint_index=robot.GRIPPER_JOINT_INDEX,
+            servo_ids=robot.SERVO_IDS,
+            resolution=robot.RESOLUTION,
+        )
+
+    raise HTTPException(
+        status_code=400,
+        detail=f"Robot {robot.name} does not support configuration retrieval.",
+    )
+
+
+@router.post(
+    "/teleop/settings/read",
+    response_model=TeleopSettings,
+    summary="Read Teleop Settings",
+    description="Get current teleoperation settings.",
+)
+async def read_teleop_settings(
+    teleop_manager: TeleopManager = Depends(get_teleop_manager),
+) -> TeleopSettings:
+    """
+    Get current teleoperation settings.
+    """
+    return teleop_manager.settings
+
+
+@router.post(
+    "/teleop/settings",
+    response_model=StatusResponse,
+    summary="Update Teleop Settings",
+    description="Update teleoperation settings such as VR scaling factor.",
+)
+async def update_teleop_settings(
+    settings: TeleopSettingsRequest,
+    teleop_manager: TeleopManager = Depends(get_teleop_manager),
+) -> StatusResponse:
+    """
+    Update teleoperation settings.
+    """
+    settings_dict = settings.model_dump()
+
+    for attr_name, value in settings_dict.items():
+        if hasattr(teleop_manager, attr_name):
+            setattr(teleop_manager, attr_name, value)
+        else:
+            logger.warning(
+                f"Attempted to set non-existent attribute '{attr_name}' on TeleopManager"
+            )
+
+    return StatusResponse()

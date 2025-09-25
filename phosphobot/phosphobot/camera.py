@@ -1,16 +1,30 @@
 import asyncio
 import atexit
-from functools import lru_cache
+import base64
+import binascii
+import json
 import platform
 import subprocess
 import threading
 import time
 from abc import ABC, abstractmethod
+from functools import lru_cache
 from pathlib import Path
-from typing import AsyncGenerator, Dict, List, Literal, Optional, Tuple, cast
+from typing import (
+    Any,
+    AsyncGenerator,
+    Dict,
+    Iterable,
+    List,
+    Literal,
+    Optional,
+    Tuple,
+    cast,
+)
 
 import cv2
 import numpy as np
+import zmq
 from fastapi import Request
 from loguru import logger
 
@@ -19,9 +33,6 @@ from phosphobot.models import AllCamerasStatus, SingleCameraStatus
 from phosphobot.types import CameraTypes
 
 cameras = None
-
-
-MAX_OPENCV_INDEX = 10
 
 
 def get_camera_names() -> List[str]:
@@ -164,6 +175,12 @@ def detect_camera_type(
     if cap.isOpened():
         width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
         height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+        if width == 0 or height == 0:
+            logger.warning(
+                f"Camera {index} has invalid resolution: {width}x{height}. Assuming classic camera."
+            )
+            cap.release()
+            return "classic"
         ratio = width / height
         if ratio >= 8 / 3:
             cap.release()
@@ -182,8 +199,8 @@ def detect_camera_type(
 
 # TODO: Handle multiple realsense cameras
 def _find_cameras(
-    possible_camera_ids: list[int],
-    raise_when_empty=False,
+    possible_camera_ids: List[int],
+    raise_when_empty: bool = False,
     camera_names: List[str] = [],
 ) -> list[int]:
     """
@@ -193,8 +210,6 @@ def _find_cameras(
 
     This ignores realsense cameras.
     """
-
-    import cv2
 
     camera_ids = []
     for camera_idx in possible_camera_ids:
@@ -242,7 +257,9 @@ def _find_cameras(
 
 # TODO: Handle multiple realsense cameras
 def detect_video_indexes(
-    max_index_search_range=MAX_OPENCV_INDEX, mock=False, camera_names: List[str] = []
+    max_index_search_range: Optional[int] = None,
+    mock: bool = False,
+    camera_names: List[str] = [],
 ) -> list[int]:
     """
     Return the indexes of all available cameras.
@@ -251,11 +268,18 @@ def detect_video_indexes(
 
     This is only done once and the result is cached in self._available_camera_ids
     """
+    if max_index_search_range is None:
+        from phosphobot.configs import config
+
+        max_index_search_range = config.MAX_OPENCV_INDEX
+
     cameras = []
     if platform.system() == "Linux":
         possible_ports = [str(port) for port in Path("/dev").glob("video*")]
         possible_camera_ids = [
-            int(port.removeprefix("/dev/video")) for port in possible_ports
+            int(port.removeprefix("/dev/video"))
+            for port in possible_ports
+            if port.removeprefix("/dev/video").isdigit()
         ]
         # Sort by increasing
         possible_camera_ids = sorted(possible_camera_ids)
@@ -263,9 +287,9 @@ def detect_video_indexes(
             f"(Linux) Found possible ports through scanning '/dev/video*': {possible_camera_ids}"
         )
         # Filter out indexes > MAX_OPENCV_INDEX
-        to_remove = [idx for idx in possible_camera_ids if idx > MAX_OPENCV_INDEX]
+        to_remove = [idx for idx in possible_camera_ids if idx > max_index_search_range]
         logger.info(
-            f"Ignoring possible ports: {to_remove} (index > {MAX_OPENCV_INDEX})"
+            f"Ignoring possible ports: {to_remove} (index > {max_index_search_range})"
         )
         possible_camera_ids = [
             idx for idx in possible_camera_ids if idx not in to_remove
@@ -290,10 +314,10 @@ class BaseCamera(ABC):
     height: int
     fps: int
 
-    def __init__(self):
+    def __init__(self) -> None:
         atexit.register(self.stop)
 
-    def __del__(self):
+    def __del__(self) -> None:
         self.stop()
 
     @property
@@ -302,7 +326,7 @@ class BaseCamera(ABC):
 
     @abstractmethod
     def get_rgb_frame(
-        self, resize: tuple[int, int] | None = None
+        self, resize: Optional[tuple[int, int]] = None
     ) -> Optional[cv2.typing.MatLike]:
         """Get the latest frame from the camera."""
         pass
@@ -318,10 +342,10 @@ class BaseCamera(ABC):
 
     def get_jpeg_rgb_frame(
         self,
-        target_size: tuple[int, int] | None,
-        quality: int | None,
+        target_size: Optional[tuple[int, int]],
+        quality: Optional[int],
         is_video_frame: bool = True,
-    ) -> bytes | None:
+    ) -> Optional[bytes]:
         if is_video_frame:
             rgb_frame = self.get_rgb_frame(resize=target_size)
         else:
@@ -341,10 +365,10 @@ class BaseCamera(ABC):
 
     async def generate_rgb_frames(
         self,
-        target_size: tuple[int, int] | None,
-        quality: int | None,
+        target_size: Optional[tuple[int, int]],
+        quality: Optional[int],
         is_video_frame: bool = True,
-        request: Request | None = None,
+        request: Optional[Request] = None,
     ) -> AsyncGenerator:
         """Generator for video frames"""
         try:
@@ -379,9 +403,6 @@ class BaseCamera(ABC):
         except Exception as e:
             logger.warning(f"{self.camera_name} Error generating frames: {str(e)}")
             self.stop()
-
-    async def generate_depth_frames(self):
-        return await self.generate_rgb_frames(is_video_frame=False)
 
 
 class VideoCamera(threading.Thread, BaseCamera):
@@ -518,7 +539,7 @@ Camera type: {self.camera_type}""")
                     self.last_frame = frame
 
     def get_rgb_frame(
-        self, resize: tuple[int, int] | None = None
+        self, resize: Optional[tuple[int, int]] = None
     ) -> Optional[cv2.typing.MatLike]:
         """
         Read a frame from the camera. Returns None if the frame could not be read.
@@ -531,7 +552,7 @@ Camera type: {self.camera_type}""")
         if self.last_frame is None:
             logger.warning(f"{self.camera_name}: No frame available")
 
-        frame: np.ndarray | None = None
+        frame: Optional[np.ndarray] = None
         # Convert from BGR to RGB
         if self.last_frame is not None:
             frame = cv2.cvtColor(self.last_frame, cv2.COLOR_BGR2RGB)
@@ -555,13 +576,13 @@ class DummyCamera(VideoCamera):
         width: int = 640,
         height: int = 480,
         fps: int = 30,
-    ):
+    ) -> None:
         self.width = width
         self.height = height
         self.fps = fps
         super().__init__(camera_type=camera_type)
 
-    def init_camera(self):
+    def init_camera(self) -> bool:
         """
         The simulated camera cannot be opened with opencv, so we return True.
         """
@@ -569,7 +590,7 @@ class DummyCamera(VideoCamera):
         return True
 
     def get_rgb_frame(
-        self, resize: tuple[int, int] | None = None
+        self, resize: Optional[Tuple[int, int]] = None
     ) -> Optional[cv2.typing.MatLike]:
         """
         Read a frame from the camera. Returns None if the frame could not be read.
@@ -612,7 +633,7 @@ class StereoCamera(VideoCamera):
         return f"StereoCamera {self.camera_id}"
 
     def get_left_eye_rgb_frame(
-        self, resize: tuple[int, int] | None = None
+        self, resize: Optional[Tuple[int, int]] = None
     ) -> Optional[cv2.typing.MatLike]:
         last_frame = self.get_rgb_frame()
         if last_frame is None:
@@ -625,7 +646,7 @@ class StereoCamera(VideoCamera):
         return left_frame
 
     def get_right_eye_rgb_frame(
-        self, resize: tuple[int, int] | None = None
+        self, resize: Optional[Tuple[int, int]] = None
     ) -> Optional[cv2.typing.MatLike]:
         last_frame = self.get_rgb_frame()
         if last_frame is None:
@@ -726,13 +747,12 @@ try:
                 config.enable_device(self.device_serial)
 
                 # Configure streams
+                # Intialize at 30FPS
                 config.enable_stream(
-                    stream_type=rs.stream.color,
-                    format=rs.format.bgr8,
+                    stream_type=rs.stream.color, format=rs.format.bgr8, framerate=30
                 )
                 config.enable_stream(
-                    stream_type=rs.stream.depth,
-                    format=rs.format.z16,
+                    stream_type=rs.stream.depth, format=rs.format.z16, framerate=30
                 )
 
                 # Add a small delay to ensure device is ready
@@ -781,7 +801,7 @@ try:
             return f"RealsenseCamera {self.device_index} ({self.device_serial})"
 
         def get_rgb_frame(
-            self, resize: tuple[int, int] | None = None
+            self, resize: Optional[Tuple[int, int]] = None
         ) -> Optional[cv2.typing.MatLike]:
             # To get the video frame, get the couple (video, depth) frame from the wait_for_frames method
             if not self.is_active:
@@ -802,7 +822,7 @@ try:
             return frame
 
         def get_depth_frame(
-            self, resize: tuple[int, int] | None = None
+            self, resize: Optional[Tuple[int, int]] = None
         ) -> Optional[cv2.typing.MatLike]:
             # To get the depth frame, also get the couple (video, depth) frame from the wait_for_frames method
             # The method get_depth and get_rgb_frame can be called simultaneously without lagging (tested)
@@ -857,11 +877,11 @@ try:
             return self.realsense_camera.is_active
 
         @is_active.setter
-        def is_active(self, value):
+        def is_active(self, value: bool) -> None:
             return
 
         def get_rgb_frame(
-            self, resize: Optional[tuple[int, int]] = None
+            self, resize: Optional[Tuple[int, int]] = None
         ) -> Optional[cv2.typing.MatLike]:
             if not self.is_active:
                 return None
@@ -897,27 +917,170 @@ except ImportError:
     REALSENSE_AVAILABLE = False
 
     class RealSenseCamera(BaseCamera):  # type: ignore
-        def __init__(self, *args, **kwargs):
+        def __init__(self, *args: Iterable[Any], **kwargs: Dict[str, Any]) -> None:
             raise ImportError("Install pyrealsense2 to add RealSense camera support.")
 
     class RealSenseVirtualCamera(VideoCamera):  # type: ignore
-        def __init__(self, *args, **kwargs):
+        def __init__(self, *args: Iterable[Any], **kwargs: Dict[str, Any]) -> None:
             raise ImportError("Install pyrealsense2 to add RealSense camera support.")
 
 
+class ZMQCamera(VideoCamera):
+    """
+    A camera that connects to a ZMQ PUSH socket, receiving JSON-serialized
+    data with base64-encoded camera frames and performing manual topic filtering.
+    """
+
+    camera_type: CameraTypes = "zmq"
+    connect_to: str
+    topic: Optional[str]
+    stream_initialized: bool = False
+    context: Optional[zmq.Context] = None
+    socket: Optional[zmq.Socket] = None
+    poller: Optional[zmq.Poller] = None
+
+    def __init__(
+        self,
+        connect_to: str = "tcp://localhost:5555",
+        topic: Optional[str] = None,
+        disable: bool = False,
+        camera_id: Optional[int] = None,
+    ):
+        self.connect_to = connect_to
+        self.topic = topic if topic and topic.strip() else None
+        self.stream_initialized = False
+        super().__init__(video=None, disable=disable, camera_id=camera_id)
+        self.last_frame = None
+        self.lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self.thread = None
+
+    @property
+    def camera_name(self) -> str:
+        if self.topic:
+            return f"ZMQCamera(addr='{self.connect_to}', topic='{self.topic}')"
+        return f"ZMQCamera(addr='{self.connect_to}', receives_all_topics)"
+
+    def init_camera(self) -> bool:
+        """Initializes the ZMQ PULL socket."""
+        try:
+            logger.info(f"{self.camera_name}: Connecting to ZMQ PUSH server...")
+            self.context = zmq.Context()
+            self.socket = self.context.socket(zmq.PULL)
+            self.socket.setsockopt(zmq.RCVTIMEO, 2000)
+            self.socket.connect(self.connect_to)
+
+            if self.topic:
+                logger.info(
+                    f"{self.camera_name}: Will manually filter for topic '{self.topic}'."
+                )
+            else:
+                logger.warning(
+                    f"{self.camera_name}: No topic set, will process all received messages."
+                )
+
+            self.poller = zmq.Poller()
+            self.poller.register(self.socket, zmq.POLLIN)
+            self.width, self.height = 0, 0
+            self.fps = 30
+
+            logger.success(f"{self.camera_name}: ZMQ PULL connection established.")
+            return True
+        except Exception as e:
+            logger.error(
+                f"{self.camera_name}: Failed to initialize ZMQ connection: {e}"
+            )
+            return False
+
+    def _process_frame_data(self, data: dict) -> None:
+        """Helper function to process a received data dictionary and update the frame."""
+        if not self.stream_initialized:
+            shape = data["shape"]
+            self.height, self.width, _ = shape
+            self.stream_initialized = True
+            logger.success(
+                f"{self.camera_name}: Stream properties detected: {self.width}x{self.height}"
+            )
+
+        frame_bytes = base64.b64decode(data["frame_bytes"])
+        frame = np.frombuffer(frame_bytes, dtype=np.dtype(data["dtype"]))
+        reconstructed_frame = frame.reshape(data["shape"])
+        with self.lock:
+            self.last_frame = cv2.cvtColor(reconstructed_frame, cv2.COLOR_RGB2BGR)
+
+    def run(self) -> None:
+        """Polls the ZMQ PULL socket and manually filters messages by topic."""
+        if not self.socket or not self.poller:
+            logger.error(f"{self.camera_name}: Cannot run, ZMQ socket not initialized.")
+            return
+
+        while not self._stop_event.is_set():
+            socks = dict(self.poller.poll(timeout=100))
+            if self.socket in socks and socks[self.socket] == zmq.POLLIN:
+                try:
+                    message_parts = self.socket.recv_multipart(flags=zmq.NOBLOCK)
+                    if len(message_parts) < 2:
+                        continue  # Ignore malformed messages
+
+                    received_topic = message_parts[0].decode()
+
+                    # Process if this message is for us, or if we accept all topics
+                    if self.topic is None or received_topic == self.topic:
+                        json_bytes = message_parts[1]
+                        data = json.loads(json_bytes.decode("utf-8"))
+                        self._process_frame_data(data)
+
+                except zmq.Again:
+                    continue
+                except (
+                    json.JSONDecodeError,
+                    binascii.Error,
+                    KeyError,
+                    IndexError,
+                    TypeError,
+                ) as e:
+                    logger.warning(
+                        f"{self.camera_name}: Malformed data packet. Error: {e}"
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"{self.camera_name}: Unexpected error processing frame: {e}"
+                    )
+
+        logger.info(f"{self.camera_name}: Thread stopped.")
+
+    def stop(self) -> None:
+        """Extends the parent stop method to gracefully close ZMQ resources."""
+        if self._stop_event.is_set():
+            return
+        logger.debug(f"{self.camera_name}: Stopping...")
+        self._stop_event.set()
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=2.0)
+
+        try:
+            if self.socket:
+                self.socket.close()
+            if self.context:
+                self.context.term()
+        except Exception as e:
+            logger.error(f"{self.camera_name}: Error during ZMQ cleanup: {e}")
+
+
 class AllCameras:
-    disabled_cameras: list[int] | None
+    disabled_cameras: Optional[List[int]]
     video_cameras: List[VideoCamera]
     realsense_cameras: List[RealSenseCamera]
+    zmq_cameras: List[ZMQCamera]
 
     camera_ids: List[int]
     camera_names: List[str]
-    _main_camera: BaseCamera | None = None
+    _main_camera: Optional[BaseCamera] = None
     # If it's None, record everything. Otherwise, record only the corresponding cameras
     _cameras_ids_to_record: List[int]
     _is_detecting: bool = False
 
-    def __init__(self, disabled_cameras: list[int] | None = None):
+    def __init__(self, disabled_cameras: Optional[List[int]] = None):
         """
         AllCameras class to manage all cameras connected to the computer.
         Args:
@@ -933,10 +1096,38 @@ class AllCameras:
         # Add atexit hook to stop the cameras
         atexit.register(self.stop)
 
-    def detect_cameras(self):
+    @property
+    def cameras(self) -> List[BaseCamera]:
+        """
+        Returns a list of all cameras ordered as: video cameras by camera_id,
+        realsense cameras by device_index, then zmq cameras in order added.
+        """
+        all_cameras: List[BaseCamera] = []
+
+        # Video cameras first, ordered by camera_id
+        sorted_video_cameras = sorted(
+            self.video_cameras,
+            key=lambda cam: cam.camera_id if cam.camera_id is not None else 0,
+        )
+        all_cameras.extend(sorted_video_cameras)
+
+        # RealSense cameras second, ordered by device_index
+        sorted_realsense_cameras = sorted(
+            self.realsense_cameras, key=lambda cam: cam.device_index
+        )
+        all_cameras.extend(sorted_realsense_cameras)
+
+        # ZMQ cameras last, in order they were added
+        all_cameras.extend(self.zmq_cameras)
+
+        return all_cameras
+
+    def detect_cameras(self) -> None:
         """
         Detect all cameras connected to the computer and initialize them.
         """
+        from phosphobot.configs import config
+
         if self._is_detecting:
             logger.warning("Cameras are already being detected, skipping")
             return
@@ -947,16 +1138,17 @@ class AllCameras:
         self.camera_names = []
         self._cameras_ids_to_record = []
         self.realsense_cameras = []
+        self.zmq_cameras = []
 
         if not config.ENABLE_CAMERAS:
             logger.warning("Cameras are disabled")
-            self.disabled_cameras = list(range(MAX_OPENCV_INDEX))
+            self.disabled_cameras = list(range(config.MAX_OPENCV_INDEX))
             return
 
         camera_names = get_camera_names()
         self.initialize_realsense_camera()
 
-        # Get the available video indexes from a range of 0 to MAX_OPENCV_INDEX
+        # Get the available video indexes from a range of 0 to config.MAX_OPENCV_INDEX
         possible_camera_ids = detect_video_indexes()
 
         # For every of these index we will try to detect the camera type
@@ -984,9 +1176,6 @@ class AllCameras:
                     video=cv2.VideoCapture(index),
                     disable=self.disabled_cameras is not None
                     and index in self.disabled_cameras,
-                    width=1280,
-                    height=480,
-                    fps=30,
                     camera_id=index,
                 )
                 # Set the camera_id to the first position and reindex
@@ -1058,6 +1247,77 @@ class AllCameras:
         self._cameras_ids_to_record = self.camera_ids
         self._is_detecting = False
 
+    def add_custom_camera(self, camera: BaseCamera) -> None:
+        """
+        Manually adds an initialized custom camera instance to the list of active cameras.
+        This is useful for adding virtual or non-discoverable cameras like ZMQCamera.
+
+        Args:
+            camera: An instance of a class that inherits from BaseCamera.
+        """
+
+        # According to the camera type, add it to the appropriate list
+        if isinstance(camera, VideoCamera):
+            # Assign camera_id if not already set
+            if camera.camera_id is None:
+                max_id = max(self.camera_ids) if self.camera_ids else -1
+                camera.camera_id = max_id + 1
+
+            self.video_cameras.append(camera)
+            self.camera_ids.append(camera.camera_id)
+
+        elif isinstance(camera, RealSenseCamera):
+            self.realsense_cameras.append(camera)
+
+            # Create virtual cameras for the RealSense device if it's active
+            if camera.is_connected and camera.is_active:
+                # Generate unique camera IDs for virtual cameras
+                max_id = max(self.camera_ids) if self.camera_ids else -1
+                virtual_rgb_id = max_id + 1
+                virtual_depth_id = max_id + 2
+
+                # Create virtual cameras for this RealSense device
+                virtual_rgb = RealSenseVirtualCamera(
+                    camera,
+                    "rgb",
+                    virtual_rgb_id,
+                    disable=False,
+                )
+                virtual_depth = RealSenseVirtualCamera(
+                    camera,
+                    "depth",
+                    virtual_depth_id,
+                    disable=False,
+                )
+
+                # Add to video cameras and camera IDs
+                self.video_cameras.extend([virtual_rgb, virtual_depth])
+                self.camera_ids.extend([virtual_rgb_id, virtual_depth_id])
+
+                logger.info(
+                    f"Added virtual cameras for RealSense device (RGB: {virtual_rgb_id}, Depth: {virtual_depth_id})"
+                )
+
+        elif isinstance(camera, ZMQCamera):
+            # Assign camera_id if not already set
+            if camera.camera_id is None:
+                max_id = max(self.camera_ids) if self.camera_ids else -1
+                camera.camera_id = max_id + 1
+
+            self.zmq_cameras.append(camera)
+            self.camera_ids.append(camera.camera_id)
+
+        else:
+            raise ValueError(
+                "Custom camera must be an instance of VideoCamera, RealSenseCamera, or ZMQCamera"
+            )
+
+        # Add the camera name to the list
+        self.camera_names.append(camera.camera_name)
+        logger.info(
+            f"Custom camera added: {camera.camera_name} Type: {camera.camera_type} ID: {getattr(camera, 'camera_id', 'N/A')}"
+        )
+
     def refresh(self) -> None:
         """
         Refresh the list of cameras.
@@ -1074,7 +1334,7 @@ class AllCameras:
         """
         Return True if at least one camera is active. False otherwise.
         """
-        return any(camera.is_active for camera in self.video_cameras)
+        return any(camera.is_active for camera in self.cameras)
 
     def initialize_realsense_camera(self, max_retries: int = 3) -> None:
         """
@@ -1171,7 +1431,7 @@ class AllCameras:
             video_cameras_ids=self.camera_ids,
             realsense_available=realsense_available,
             is_stereo_camera_available=any(
-                camera.camera_type == "stereo" for camera in self.video_cameras
+                camera.camera_type == "stereo" for camera in self.cameras
             ),
             cameras_status=[
                 SingleCameraStatus(
@@ -1182,24 +1442,22 @@ class AllCameras:
                     height=camera.height,
                     fps=camera.fps,
                 )
-                for camera in self.video_cameras
-                if camera.camera_id is not None
+                for camera in self.cameras
+                if hasattr(camera, "camera_id") and camera.camera_id is not None
             ],
         )
 
-    def stop(self):
-        for camera in self.video_cameras:
-            camera.stop()
-        for camera in self.realsense_cameras:
+    def stop(self) -> None:
+        for camera in self.cameras:
             camera.stop()
 
-    def get_camera_by_id(self, id: int) -> Optional[VideoCamera]:
+    def get_camera_by_id(self, id: int) -> Optional[BaseCamera]:
         if id not in self.camera_ids:
             logger.warning(f"Camera with id {id} not available in {self.camera_ids}")
             return None
 
-        for camera in self.video_cameras:
-            if camera.camera_id == id:
+        for camera in self.cameras:
+            if hasattr(camera, "camera_id") and camera.camera_id == id:
                 return camera
 
         logger.warning(f"Camera with id {id} not available in {self.camera_ids}")
@@ -1208,7 +1466,7 @@ class AllCameras:
     def get_rgb_frame(
         self,
         camera_id: Optional[int] = None,
-        resize: Optional[tuple[int, int]] = None,
+        resize: Optional[Tuple[int, int]] = None,
     ) -> Optional[cv2.typing.MatLike]:
         """
         Return the latest RGB frame from the specidied camera
@@ -1234,26 +1492,27 @@ class AllCameras:
         return frame
 
     def get_rgb_frames_for_all_cameras(
-        self, resize: Optional[tuple[int, int]] = None
-    ) -> Dict[str, cv2.typing.MatLike | None]:
+        self, resize: Optional[Tuple[int, int]] = None
+    ) -> Dict[str, Optional[cv2.typing.MatLike]]:
         """
         Get the RGB frames for all the cameras.
 
         Returns a dict with the camera id as key and the frame as value.
         """
-        frames: dict[str, cv2.typing.MatLike | None] = {}
+        frames: Dict[str, Optional[cv2.typing.MatLike]] = {}
         for camera in self.video_cameras:
+            if camera.is_active is False:
+                continue
+
             if camera.camera_type == "stereo":
                 camera = cast(StereoCamera, camera)
                 left_side = camera.get_left_eye_rgb_frame(resize=resize)
                 right_side = camera.get_right_eye_rgb_frame(resize=resize)
-                frames[f"camera_{len(frames)}"] = left_side
-                frames[f"camera_{len(frames)}"] = right_side
-            elif camera.camera_type == "classic":
-                frame = camera.get_rgb_frame(resize=resize)
-                frames[f"camera_{len(frames)}"] = frame
+                frames[f"{camera.camera_id}_left"] = left_side
+                frames[f"{camera.camera_id}_right"] = right_side
             else:
-                logger.warning(f"Unknown camera type: {camera.camera_type}")
+                frame = camera.get_rgb_frame(resize=resize)
+                frames[f"{camera.camera_id}"] = frame
         return frames
 
     @property
@@ -1264,7 +1523,7 @@ class AllCameras:
         return self._cameras_ids_to_record
 
     @cameras_ids_to_record.setter
-    def cameras_ids_to_record(self, camera_ids: List[int] | None):
+    def cameras_ids_to_record(self, camera_ids: Optional[List[int]]) -> None:
         """
         Set the camera ids to record.
         """
@@ -1278,7 +1537,7 @@ class AllCameras:
             self._cameras_ids_to_record = self.camera_ids
 
     @property
-    def main_camera(self) -> BaseCamera | None:
+    def main_camera(self) -> Optional[BaseCamera]:
         """
         Get the main camera among the selected camera ids.
         If selected camera ids are not provided, we select amoung all available cameras.
@@ -1303,7 +1562,7 @@ class AllCameras:
         return self._main_camera
 
     @main_camera.setter
-    def main_camera(self, camera: BaseCamera):
+    def main_camera(self, camera: BaseCamera) -> None:
         """
         Explicitly set the main camera.
         """
@@ -1311,8 +1570,8 @@ class AllCameras:
 
     def get_main_camera_frames(
         self,
-        target_video_size: tuple[int, int],
-    ) -> List[cv2.typing.MatLike] | None:
+        target_video_size: Tuple[int, int],
+    ) -> Optional[List[cv2.typing.MatLike]]:
         """
         Get the frames from the main camera.
         """
@@ -1365,7 +1624,7 @@ class AllCameras:
 
     def get_secondary_camera_frames(
         self,
-        target_video_size: tuple[int, int],
+        target_video_size: Tuple[int, int],
     ) -> List[cv2.typing.MatLike]:
         """
         Get the frames from every camera except the main camera.
@@ -1425,6 +1684,21 @@ class AllCameras:
 
         return secondary_camera_key_names
 
+    def get_all_camera_key_names(self) -> List[str]:
+        """
+        Get the keys for all the cameras, including the main camera.
+        """
+        camera_key_names = []
+
+        # Add main camera key
+        if self.main_camera is not None:
+            camera_key_names.append("observation.images.main")
+
+        # Add secondary cameras keys
+        camera_key_names.extend(self.get_secondary_camera_key_names())
+
+        return camera_key_names
+
 
 @lru_cache()
 def get_all_cameras() -> AllCameras:
@@ -1439,7 +1713,7 @@ def get_all_cameras() -> AllCameras:
     return cameras
 
 
-def get_all_cameras_no_init() -> AllCameras | None:
+def get_all_cameras_no_init() -> Optional[AllCameras]:
     """
     Return the global AllCameras instance without initializing it.
     This is useful for testing purposes.

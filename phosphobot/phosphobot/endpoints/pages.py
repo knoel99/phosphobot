@@ -1,10 +1,9 @@
-import os
-import cv2
-import random
 import base64
+import os
+import random
 import traceback
 from pathlib import Path, PurePath
-from typing import Literal, cast
+from typing import Literal, Union, cast
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse
@@ -12,38 +11,41 @@ from huggingface_hub import HfApi
 from loguru import logger
 
 from phosphobot.am.base import ActionModel, TrainingRequest
+from phosphobot.am.pi05 import Pi05
 from phosphobot.configs import config
 from phosphobot.models import (
     AdminSettingsRequest,
     AdminSettingsResponse,
     AdminSettingsTokenResponse,
+    BaseDataset,
     BrowseFilesResponse,
     BrowserFilesRequest,
-    BaseDataset,
     DatasetListResponse,
     DatasetRepairRequest,
     DatasetShuffleRequest,
     DatasetSplitRequest,
     DeleteEpisodeRequest,
+    EpisodesModel,
     HFDownloadDatasetRequest,
+    HFWhoamIResponse,
     HuggingFaceTokenRequest,
+    InfoModel,
     InfoResponse,
-    MergeDatasetsRequest,
     ItemInfo,
-    ModelVideoKeysRequest,
-    ModelVideoKeysResponse,
+    LeRobotDataset,
+    MergeDatasetsRequest,
+    ModelConfigurationRequest,
+    ModelConfigurationResponse,
     StatusResponse,
     TrainingInfoRequest,
     TrainingInfoResponse,
     VizSettingsResponse,
     WandBTokenRequest,
-    InfoModel,
 )
-from phosphobot.models import EpisodesModel, LeRobotDataset
 from phosphobot.utils import (
     get_hf_token,
-    get_resources_path,
     get_home_app_path,
+    get_resources_path,
     is_running_on_pi,
     login_to_hf,
     parse_hf_username_or_orgid,
@@ -62,6 +64,7 @@ INDEX_PATH = get_resources_path() / "dist" / "index.html"
 @router.get("/auth", response_class=HTMLResponse)
 @router.get("/sign-in", response_class=HTMLResponse)
 @router.get("/sign-up", response_class=HTMLResponse)
+@router.get("/sign-up/confirm", response_class=HTMLResponse)
 @router.get("/auth/confirm", response_class=HTMLResponse)
 @router.get("/auth/forgot-password", response_class=HTMLResponse)
 @router.get("/auth/reset-password", response_class=HTMLResponse)
@@ -74,7 +77,7 @@ INDEX_PATH = get_resources_path() / "dist" / "index.html"
 @router.get("/train", response_class=HTMLResponse)
 @router.get("/inference", response_class=HTMLResponse)
 @router.get("/", response_class=HTMLResponse)
-async def serve_dashboard(request: Request):
+async def serve_dashboard(request: Request) -> HTMLResponse:
     with open(INDEX_PATH.resolve(), "r") as f:
         content = f.read()
     return HTMLResponse(
@@ -83,7 +86,7 @@ async def serve_dashboard(request: Request):
 
 
 @router.get("/admin/settings", response_model=AdminSettingsResponse)
-async def get_admin_settings():
+async def get_admin_settings() -> AdminSettingsResponse:
     return AdminSettingsResponse(
         dataset_name=config.DEFAULT_DATASET_NAME,
         freq=config.DEFAULT_FREQ,
@@ -92,11 +95,12 @@ async def get_admin_settings():
         video_size=config.DEFAULT_VIDEO_SIZE,
         task_instruction=config.DEFAULT_TASK_INSTRUCTION,
         cameras_to_record=config.DEFAULT_CAMERAS_TO_RECORD,
+        hf_private_mode=config.DEFAULT_HF_PRIVATE_MODE,
     )
 
 
 @router.post("/admin/settings/tokens", response_model=AdminSettingsTokenResponse)
-async def get_admin_settings_token():
+async def get_admin_settings_token() -> AdminSettingsTokenResponse:
     # Return bool if the token is set and valid
     return AdminSettingsTokenResponse(
         huggingface=login_to_hf(revalidate=False),
@@ -105,7 +109,7 @@ async def get_admin_settings_token():
 
 
 @router.get("/viz/settings", response_model=VizSettingsResponse)
-def get_viz_settings(request: Request):
+def get_viz_settings(request: Request) -> VizSettingsResponse:
     """
     Page with an overview of the connected cameras. Open this page in the chrome browser.
     """
@@ -184,8 +188,8 @@ def list_directory_items(path: str, root_dir: str = "") -> list[ItemInfo]:
     return items_info
 
 
-@router.post("/files", response_model=BrowseFilesResponse)
-async def files(query: BrowserFilesRequest):
+@router.post("/files", response_model=None)
+async def files(query: BrowserFilesRequest) -> Union[BrowseFilesResponse, FileResponse]:
     # Record page view
     safe_path = sanitize_path(query.path)
     root = Path(ROOT_DIR)
@@ -236,14 +240,12 @@ async def files(query: BrowserFilesRequest):
     return response_data
 
 
-@router.post("/admin/huggingface/whoami")
-async def whoami():
+@router.post("/admin/huggingface/whoami", response_model=HFWhoamIResponse)
+async def whoami() -> HFWhoamIResponse:
     # Fetch the Hugging Face token and try to run whoami to return the person id
     token_path = str(get_home_app_path()) + "/huggingface.token"
     if not os.path.exists(token_path):
-        return {
-            "status": "error",
-        }
+        return HFWhoamIResponse(status="error")
     try:
         with open(token_path, "r") as token_file:
             token = token_file.read().strip()
@@ -253,36 +255,32 @@ async def whoami():
         username_or_orgid = parse_hf_username_or_orgid(user_info)
         logger.info(f"Token is valid for {username_or_orgid}")
         if username_or_orgid is None:
-            return {
-                "status": "error",
-            }
-        return {
-            "status": "success",
-            "username": username_or_orgid,
-        }
+            return HFWhoamIResponse(status="error")
+        return HFWhoamIResponse(
+            status="ok",
+            username=username_or_orgid,
+        )
     except Exception:
-        return {
-            "status": "error",
-        }
+        return HFWhoamIResponse(status="error")
 
 
-@router.post("/admin/huggingface")
-async def submit_token(query: HuggingFaceTokenRequest):
+@router.post("/admin/huggingface", response_model=StatusResponse)
+async def submit_token(query: HuggingFaceTokenRequest) -> StatusResponse:
     if query.token == "":
         # Delete the token file if the token is empty
         file_path = str(get_home_app_path()) + "/huggingface.token"
         if os.path.exists(file_path):
             try:
                 os.remove(file_path)
-                return {
-                    "status": "success",
-                    "message": "The file huggingface.token has been removed.",
-                }
+                return StatusResponse(
+                    status="ok",
+                    message="The file huggingface.token has been removed.",
+                )
             except Exception as e:
-                return {
-                    "status": "error",
-                    "message": f"Error removing Hugging Face token: {str(e)}",
-                }
+                return StatusResponse(
+                    status="error",
+                    message=f"Error removing Hugging Face token: {str(e)}",
+                )
 
     # Try first to connect to HuggingFace with the token
     try:
@@ -291,15 +289,15 @@ async def submit_token(query: HuggingFaceTokenRequest):
         # Get the username or org that has write access
         username_or_orgid = parse_hf_username_or_orgid(user_info)
         if username_or_orgid is None:
-            return {
-                "status": "error",
-                "message": "The token does not have write access to any repository. Please add 'Write access to content/settings' in the token scope.",
-            }
+            return StatusResponse(
+                status="error",
+                message="The token does not have write access to any repository. Please add 'Write access to content/settings' in the token scope.",
+            )
     except Exception as e:
-        return {
-            "status": "error",
-            "message": f"Error connecting to Hugging Face: {str(e)}",
-        }
+        return StatusResponse(
+            status="error",
+            message=f"Error connecting to Hugging Face: {str(e)}",
+        )
 
     # Define the file path where the token will be saved
     file_path = str(get_home_app_path()) + "/huggingface.token"
@@ -315,15 +313,20 @@ async def submit_token(query: HuggingFaceTokenRequest):
         # Auth again to HuggingFace
         login_to_hf()
 
-        return {"status": "success", "message": "Token saved successfully!"}
+        return StatusResponse(
+            status="ok",
+            message="Token saved successfully!",
+        )
 
     except Exception as e:
-        logger.error(f"Error saving token: {str(e)}")
-        return {"status": "error", "message": f"Error saving token: {str(e)}"}
+        return StatusResponse(
+            status="error",
+            message=f"Error saving token: {str(e)}",
+        )
 
 
-@router.post("/admin/wandb")
-async def submit_wandb_token(query: WandBTokenRequest):
+@router.post("/admin/wandb", response_model=StatusResponse)
+async def submit_wandb_token(query: WandBTokenRequest) -> StatusResponse:
     # For now, we don't perform any check on the token
     # TODO: make sure an invalid token won't crash the training process
 
@@ -335,21 +338,21 @@ async def submit_wandb_token(query: WandBTokenRequest):
         if os.path.exists(file_path):
             try:
                 os.remove(file_path)
-                return {
-                    "status": "success",
-                    "message": "The file wandb.token has been removed.",
-                }
+                return StatusResponse(
+                    status="ok",
+                    message="The file wandb.token has been removed.",
+                )
             except Exception as e:
-                return {
-                    "status": "error",
-                    "message": f"Error removing WandB token: {str(e)}",
-                }
+                return StatusResponse(
+                    status="error",
+                    message=f"Error removing WandB token: {str(e)}",
+                )
 
     if len(query.token) != 40:
-        return {
-            "status": "error",
-            "message": "Wrong token, make sure to copy/paste the 40 characters long token at https://wandb.ai/authorize",
-        }
+        return StatusResponse(
+            status="error",
+            message="Wrong token, make sure to copy/paste the 40 characters long token at https://wandb.ai/authorize",
+        )
 
     try:
         # Open the file in write mode and save the token
@@ -360,29 +363,31 @@ async def submit_wandb_token(query: WandBTokenRequest):
         # Change config
         logger.info("Token saved successfully!")
 
-        return {"status": "success", "message": "Token saved successfully!"}
+        return StatusResponse(status="ok", message="Token saved successfully!")
 
     except Exception as e:
-        logger.error(f"Error saving token: {str(e)}")
-        return {
-            "status": "error",
-            "message": f"Error saving token: {str(e)}",
-        }
+        raise HTTPException(status_code=400, detail=f"Error saving token: {str(e)}")
 
 
-@router.post("/admin/form/usersettings")
-async def submit_user_settings(user_settings: AdminSettingsRequest):
+@router.post("/admin/form/usersettings", response_model=StatusResponse)
+async def submit_user_settings(user_settings: AdminSettingsRequest) -> StatusResponse:
     try:
+        logger.debug(f"User Settings submission: {user_settings.model_dump()}")
         config.save_user_settings(user_settings.model_dump())
 
-        return {"status": "success", "message": "User settings saved successfully!"}
+        return StatusResponse(
+            status="ok",
+            message="User settings saved successfully!",
+        )
     except Exception as e:
-        logger.error(f"User Settings submission error: {e}")
-        return {"status": "error", "message": f"Error saving user settings: {str(e)}"}
+        raise HTTPException(
+            status_code=400,
+            detail=f"Error saving user settings: {str(e)}",
+        )
 
 
-@router.post("/dataset/delete")
-async def delete_dataset(request: Request, path: str):
+@router.post("/dataset/delete", response_model=StatusResponse)
+async def delete_dataset(request: Request, path: str) -> StatusResponse:
     dataset_path = os.path.join(ROOT_DIR, path)
     # Check if the path exists and is a directory
     if not os.path.exists(dataset_path) or not os.path.isdir(dataset_path):
@@ -437,6 +442,8 @@ async def get_dataset_info(path: str) -> InfoResponse:
             status="error",
         )
 
+    import cv2
+
     image_frames = {}
     for key in info.features.observation_images.keys():
         # Extract first frame from first video file
@@ -471,7 +478,7 @@ async def get_dataset_info(path: str) -> InfoResponse:
 
 
 @router.post("/dataset/merge")
-async def merge_datasets(merge_request: MergeDatasetsRequest):
+async def merge_datasets(merge_request: MergeDatasetsRequest) -> StatusResponse:
     """
     Merge two datasets into one.
     """
@@ -568,6 +575,12 @@ async def merge_datasets(merge_request: MergeDatasetsRequest):
             new_dataset_name=merge_request.new_dataset_name,
             video_transform=merge_request.image_key_mappings,
         )
+    # if the dataset already exists, we raise an error
+    except FileExistsError as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Dataset {merge_request.new_dataset_name} already exists: {e}",
+        )
     except Exception as e:
         logger.error(f"Error merging datasets: {e}")
         raise HTTPException(
@@ -579,7 +592,7 @@ async def merge_datasets(merge_request: MergeDatasetsRequest):
 
 
 @router.post("/dataset/list", response_model=DatasetListResponse)
-async def list_datasets():
+async def list_datasets() -> DatasetListResponse:
     """
     List all datasets that are both in Hugging Face and locally.
     """
@@ -627,7 +640,7 @@ async def list_datasets():
 
 
 @router.post("/episode/delete")
-async def delete_episode(query: DeleteEpisodeRequest):
+async def delete_episode(query: DeleteEpisodeRequest) -> StatusResponse:
     """
     Delete an episode from the dataset.
     Parameters:
@@ -658,7 +671,7 @@ async def delete_episode(query: DeleteEpisodeRequest):
 
 
 @router.post("/dataset/sync")
-async def sync_dataset(path: str):
+async def sync_dataset(path: str) -> StatusResponse:
     # Extract dataset name et huggingface repo id from the path
     dataset = BaseDataset(path=os.path.join(ROOT_DIR, path))
 
@@ -669,7 +682,10 @@ async def sync_dataset(path: str):
 
 
 @router.get("/dataset/download")
-async def download_folder(folder_path: str):
+async def download_folder(folder_path: str) -> FileResponse:
+    """
+    Download a folder as a ZIP file.
+    """
     # Construct the full path
     full_path = os.path.join(ROOT_DIR, folder_path)
 
@@ -687,12 +703,12 @@ async def download_folder(folder_path: str):
     )
 
 
-@router.post("/model/video-keys", response_model=ModelVideoKeysResponse)
-async def get_model_video_keys(
-    request: ModelVideoKeysRequest,
-) -> ModelVideoKeysResponse:
+@router.post("/model/configuration", response_model=ModelConfigurationResponse)
+async def get_model_configuration(
+    request: ModelConfigurationRequest,
+) -> ModelConfigurationResponse:
     """
-    Fetch the model info from Hugging Face and return the video keys.
+    Fetch the model info from Hugging Face and return its configuration.
     """
     request.model_id = request.model_id.strip()
 
@@ -702,6 +718,7 @@ async def get_model_video_keys(
         "gr00t": Gr00tN1,
         "ACT": ACT,
         "ACT_BBOX": ACT,  # ACT_BBOX is a variant of ACT
+        "pi0.5": Pi05,
     }
     model_class = model_type_to_class.get(request.model_type)
     if model_class is None:
@@ -711,12 +728,14 @@ async def get_model_video_keys(
         )
 
     try:
-        video_keys = model_class.fetch_and_get_video_keys(model_id=request.model_id)
-        return ModelVideoKeysResponse(video_keys=video_keys)
+        config = model_class.fetch_and_get_configuration(model_id=request.model_id)
+        return ModelConfigurationResponse(
+            video_keys=config.video_keys, checkpoints=config.checkpoints
+        )
 
     except Exception as e:
         logger.warning(f"No video keys found for {request.model_id}: {e}")
-        return ModelVideoKeysResponse(video_keys=[])
+        return ModelConfigurationResponse(video_keys=[], checkpoints=[])
 
 
 @router.post("/training/info", response_model=TrainingInfoResponse)
@@ -724,7 +743,8 @@ async def get_training_info(
     request: TrainingInfoRequest,
 ) -> TrainingInfoResponse:
     """
-    Fetch the info.json from the model repo and return the training info.
+    - Fetch the info.json from the model repo and return the training info.
+    - If the model type is "custom", return a custom command to run the training.
     """
     if request.model_type == "custom":
         return TrainingInfoResponse(
@@ -733,6 +753,15 @@ async def get_training_info(
                 "custom_command": "python absolute/path/to/file.py --epochs 10"
             },
         )
+
+    if request.model_id is None or request.model_id.strip() == "":
+        raise HTTPException(
+            status_code=400,
+            detail="Model ID is required to fetch training info.",
+        )
+    logger.debug(
+        f"Fetching training info for model {request.model_id} of type {request.model_type}"
+    )
 
     try:
         token_path = str(get_home_app_path()) + "/huggingface.token"
@@ -777,10 +806,24 @@ async def get_training_info(
         random_suffix = "".join(
             random.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=5)
         )
+
+        # Determine private mode from config
+        private_mode = config.DEFAULT_HF_PRIVATE_MODE
+
+        # Set model name based on private mode
+        if private_mode:
+            # Use user's namespace for private training
+            model_name = f"{username_or_orgid}/{request.model_type}-{request.model_id.split('/')[1]}-{random_suffix}"
+        else:
+            # Use phospho-app namespace for public training
+            model_name = f"phospho-app/{username_or_orgid}-{request.model_type}-{request.model_id.split('/')[1]}-{random_suffix}"
+
         training_response = TrainingRequest(
             model_type=request.model_type,
             dataset_name=request.model_id,
-            model_name=f"phospho-app/{username_or_orgid}-{request.model_type}-{request.model_id.split('/')[1]}-{random_suffix}",
+            model_name=model_name,
+            private_mode=private_mode,
+            user_hf_token=None,
         )
         # Replace the fields in training_response with the values from training_params dict
         if training_response.training_params is not None:
@@ -788,19 +831,22 @@ async def get_training_info(
                 if hasattr(training_response.training_params, key):
                     setattr(training_response.training_params, key, value)
 
+        # Prepare the training body with masked token
+        training_body = training_response.model_dump(
+            exclude={
+                "wandb_api_key": True,
+                "custom_command": True,
+                "training_params": {
+                    "data_dir": True,
+                    "output_dir": True,
+                    "validation_data_dir": True,
+                },
+            }
+        )
+
         return TrainingInfoResponse(
             status="ok",
-            training_body=training_response.model_dump(
-                exclude={
-                    "wandb_api_key": True,
-                    "custom_command": True,
-                    "training_params": {
-                        "path_to_gr00t_repo": True,
-                        "data_dir": True,
-                        "output_dir": True,
-                    },
-                }
-            ),
+            training_body=training_body,
         )
     except Exception as e:
         logger.warning(f"Error fetching training info: {e}")
@@ -811,9 +857,7 @@ async def get_training_info(
 
 
 @router.post("/dataset/hf_download")
-async def hf_download_dataset(
-    query: HFDownloadDatasetRequest,
-) -> StatusResponse:
+async def hf_download_dataset(query: HFDownloadDatasetRequest) -> StatusResponse:
     if os.path.exists(os.path.join(ROOT_DIR, "lerobot_v2.1", query.dataset_name)):
         return StatusResponse(
             status="error",
@@ -883,7 +927,7 @@ async def hf_download_dataset(
 
 
 @router.post("/dataset/repair", response_model=StatusResponse)
-async def repair_dataset(query: DatasetRepairRequest):
+async def repair_dataset(query: DatasetRepairRequest) -> StatusResponse:
     """
     Repair a dataset by removing any corrupted files.
     For now, this only works for parquets files.
@@ -911,7 +955,7 @@ async def repair_dataset(query: DatasetRepairRequest):
 
 
 @router.post("/dataset/split", response_model=StatusResponse)
-async def split_dataset(query: DatasetSplitRequest):
+async def split_dataset(query: DatasetSplitRequest) -> StatusResponse:
     """
     Split a dataset into two datasets.
     Used for creating training and validation datasets.
@@ -949,7 +993,7 @@ async def split_dataset(query: DatasetSplitRequest):
 
 
 @router.post("/dataset/shuffle", response_model=StatusResponse)
-async def shuffle_dataset(query: DatasetShuffleRequest):
+async def shuffle_dataset(query: DatasetShuffleRequest) -> StatusResponse:
     """
     Shuffle a dataset in place.
     """
@@ -967,29 +1011,11 @@ async def shuffle_dataset(query: DatasetShuffleRequest):
             message="You can only shuffle datasets of type v2.1",
         )
 
-    # Shuffle the dataset
+    # Create a dataset object
     dataset = LeRobotDataset(path=dataset_path, enforce_path=True)
 
-    # Name of the new dataset after shuffling
-    new_dataset_name = f"{query.dataset_path}_shuffled"
-    while os.path.exists(os.path.join(ROOT_DIR, new_dataset_name)):
-        # Find if a int suffix is already present
-        if new_dataset_name.endswith("_shuffled"):
-            # If it ends with _shuffled, we can add a number
-            new_dataset_name += "_1"
-        else:
-            # Otherwise, parse the int and increment it
-            try:
-                suffix = int(new_dataset_name.split("_")[-1])
-                new_dataset_name = (
-                    "_".join(new_dataset_name.split("_")[:-1]) + f"_{suffix + 1}"
-                )
-            except ValueError:
-                # If the suffix is not an int, we just add _1
-                new_dataset_name += "_1"
-
     try:
-        dataset.shuffle_dataset(new_dataset_name=new_dataset_name)
+        dataset.shuffle_dataset()
     except Exception as e:
         logger.warning(f"Error shuffling dataset: {e}")
         return StatusResponse(

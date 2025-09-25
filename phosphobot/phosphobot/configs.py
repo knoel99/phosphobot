@@ -3,7 +3,7 @@ Store constants and configurations for the app in this file.
 """
 
 from pathlib import Path
-from typing import Literal
+from typing import List, Literal, Optional, Union
 
 import yaml  # type: ignore
 from loguru import logger
@@ -43,14 +43,15 @@ class Configuration(BaseModel):
     PROFILE: bool = False
 
     # Recording
-    MAIN_CAMERA_ID: int | None = None  # defaults to min(detected cameras)
+    MAIN_CAMERA_ID: Optional[int] = None  # defaults to min(detected cameras)
 
     # Whether to initialize the RealSense camera
     ENABLE_REALSENSE: bool = True
     ENABLE_CAMERAS: bool = True
     ENABLE_CAN: bool = True  # Enable CAN scanning
     # Enable crash reporting and usage telemetry
-    TELEMETRY: bool = False
+    CRASH_TELEMETRY: bool = False
+    USAGE_TELEMETRY: bool = False
 
     # How simulation should be run
     SIM_MODE: SimulationMode = SimulationMode.headless
@@ -58,8 +59,15 @@ class Configuration(BaseModel):
     ONLY_SIMULATION: bool = False
     SIMULATE_CAMERAS: bool = False
 
+    MAX_OPENCV_INDEX: int = 10
+    # Adjust based on maximum expected CAN interfaces
+    MAX_CAN_INTERFACES: int = 4
+
     # HF token
     HF_TOKEN_VALID: bool = False
+
+    # Private mode
+    DEFAULT_HF_PRIVATE_MODE: bool = False
 
     # These fields will be set after loading the user config
     DEFAULT_DATASET_NAME: str = "example_dataset"
@@ -68,17 +76,19 @@ class Configuration(BaseModel):
         "lerobot_v2.1"
     )
     DEFAULT_VIDEO_CODEC: VideoCodecs = Field(default_factory=lambda: "avc1")
-    DEFAULT_VIDEO_SIZE: list[int] = [320, 240]
+    DEFAULT_VIDEO_SIZE: List[int] = [320, 240]
     DEFAULT_TASK_INSTRUCTION: str = "None"
     # List of camera ids to disable, set to -1 to disable all cameras
-    DEFAULT_CAMERAS_TO_DISABLE: list[int] | None = None
-    DEFAULT_CAMERAS_TO_RECORD: list[int] | None = None
+    DEFAULT_CAMERAS_TO_DISABLE: Optional[List[int]] = None
+    DEFAULT_CAMERAS_TO_RECORD: Optional[List[int]] = None
 
     class Config:
         extra = "ignore"
 
     @classmethod
-    def from_yaml(cls, config_path: str | Path | None = None) -> "Configuration":
+    def from_yaml(
+        cls, config_path: Optional[Union[str, Path]] = None
+    ) -> "Configuration":
         """
         Load configuration from a YAML file.
         Args:

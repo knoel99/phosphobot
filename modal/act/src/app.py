@@ -6,13 +6,19 @@ from pathlib import Path
 from typing import Any
 
 import cv2
-import wandb
+import modal
 import numpy as np
+import sentry_sdk
+import wandb
 from fastapi import Response
 from huggingface_hub import HfApi, snapshot_download
+from huggingface_hub.errors import (
+    HFValidationError,
+    RepositoryNotFoundError,
+    RevisionNotFoundError,
+)
 from loguru import logger
 
-import modal
 from phosphobot.am.act import ACTSpawnConfig
 from phosphobot.am.base import (
     HuggingFaceTokenValidator,
@@ -24,41 +30,34 @@ from phosphobot.am.base import (
 from phosphobot.models import InfoModel
 from phosphobot.models.lerobot_dataset import LeRobotDataset
 
-MIN_NUMBER_OF_EPISODES = 10
+if os.getenv("MODAL_ENVIRONMENT") == "production":
+    sentry_sdk.init(
+        dsn="https://afa38885e368d772d8eced1bce325604@o4506399435325440.ingest.us.sentry.io/4509203019005952",
+        traces_sample_rate=1.0,
+        environment="production",
+    )
 
 phosphobot_dir = (
     Path(__file__).parent.parent.parent.parent.parent / "phosphobot" / "phosphobot"
 )
 act_image = (
-    modal.Image.from_dockerfile("Dockerfile")
+    modal.Image.debian_slim(python_version="3.10")
+    .apt_install("ffmpeg", "libavutil-dev", "libavcodec-dev", "libavformat-dev")
+    .pip_install_from_pyproject(
+        pyproject_toml=str(phosphobot_dir / "pyproject.toml"),
+    )
     .pip_install(
-        "loguru",
-        "supabase",
-        "sentry-sdk",
+        "lerobot",
         "huggingface_hub[hf_transfer]",
         "hf_xet",
         "wandb",
         "accelerate",
-        "httpx>=0.28.1",
-        "pydantic>=2.10.5",
-        "fastparquet>=2024.11.0",
-        "loguru>=0.7.3",
-        "numpy<2",
-        "opencv-python-headless>=4.0",
-        "rich>=13.9.4",
-        "pandas>=2.2.2.240807",
-        "json-numpy>=2.1.0",
-        "fastapi>=0.115.11",
-        "zmq>=0.0.0",
-        "av>=14.2.1",
         "einops",
         "torch>=2.2.1",
         "torchvision>=0.21.0",
         "pyarrow>=8.0.0",
-        "uvicorn",
         "asyncio",
         "draccus",
-        "datasets",
         "jsonlines",
         "imageio[ffmpeg]>=2.34.0",
         "zarr>=2.17.0",
@@ -66,20 +65,19 @@ act_image = (
     )
     .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})
     .env({"HF_HUB_DISABLE_TELEMETRY": "1"})
-    .pip_install_from_pyproject(
-        pyproject_toml=str(phosphobot_dir / "pyproject.toml"),
-    )
     .add_local_python_source("phosphobot")
 )
 
 MINUTES = 60  # seconds
 HOURS = 60 * MINUTES
 FUNCTION_IMAGE = act_image
-FUNCTION_TIMEOUT_TRAINING = 12 * HOURS  # 12 hours
+FUNCTION_TIMEOUT_TRAINING = 3 * HOURS  # 3 hours
 FUNCTION_TIMEOUT_INFERENCE = 6 * MINUTES  # 6 minutes
 FUNCTION_GPU_TRAINING: list[str | modal.gpu._GPUConfig | None] = ["A10G"]
 FUNCTION_GPU_INFERENCE: list[str | modal.gpu._GPUConfig | None] = ["T4"]
 FUNCTION_CPU_TRAINING = 20.0
+MIN_NUMBER_OF_EPISODES = 10
+
 
 app = modal.App("act-server")
 act_volume = modal.Volume.from_name("act", create_if_missing=True)
@@ -87,27 +85,14 @@ act_volume = modal.Volume.from_name("act", create_if_missing=True)
 paligemma_detect = modal.Function.from_name("paligemma-detector", "detect_object")
 
 
-def find_model_path(
-    model_id: str,
-) -> str | None:
-    model_path = Path(f"/data/{model_id}/")
-    # Find the latest timestamp folder
-    if model_path.exists():
-        # Get the latest timestamp folder
-        latest_timestamp = max(
-            [
-                d
-                for d in os.listdir(model_path)
-                if os.path.isdir(os.path.join(model_path, d))
-            ],
-        )
-    else:
-        return None
-    if latest_timestamp is None:
-        return None
-    model_path = (
-        model_path / latest_timestamp / "checkpoints" / "last" / "pretrained_model"
-    )
+def find_model_path(model_id: str, checkpoint: int | None = None) -> str | None:
+    model_path = Path(f"/data/{model_id}")
+    if checkpoint is not None:
+        # format the checkpoint to be 6 digits long
+        model_path = model_path / "checkpoints" / str(checkpoint) / "pretrained_model"
+        if model_path.exists():
+            return str(model_path.resolve())
+    model_path = model_path / "checkpoints" / "last" / "pretrained_model"
     if not os.path.exists(model_path):
         return None
     return str(model_path.resolve())
@@ -142,23 +127,37 @@ async def run_act_training(
     training_params: TrainingParamsAct,
     output_dir: str,
     wandb_enabled: bool,
+    wandb_run_id: str,
     timeout_seconds: int = FUNCTION_TIMEOUT_TRAINING,
 ):
     cmd = [
-        "/opt/conda/envs/lerobot/bin/python",
+        "python",
         "-m",
         "lerobot.scripts.train",
         f"--dataset.repo_id={dataset_name}",
         f"--dataset.root={dataset_path}",
         "--policy.type=act",
-        f"--batch_size={training_params.batch_size}",
-        "--wandb.project=phospho-ACT",
-        "--save_freq=2000",  # Save a checkpoint every 2000 steps
-        f"--steps={training_params.steps}",
+        "--policy.push_to_hub=false",
         "--policy.device=cuda",
         f"--output_dir={output_dir}",
+        "--wandb.project=phosphobot-ACT",
+        f"--wandb.run_id={wandb_run_id}",
         f"--wandb.enable={str(wandb_enabled).lower()}",
+        f"--job_name={wandb_run_id}",
     ]
+
+    # Add any other training parameters that are not None
+    training_params_dict = training_params.model_dump(
+        by_alias=True,
+        exclude_none=True,
+        exclude={
+            "target_detection_instruction": True,
+            "image_key": True,
+            "image_keys_to_keep": True,
+        },
+    )
+    for key, value in training_params_dict.items():
+        cmd.append(f"--{key}={value}")
 
     logger.info(f"Starting training with command: {' '.join(cmd)}")
 
@@ -215,6 +214,7 @@ async def serve(
     model_id: str,
     server_id: int,
     model_specifics: ACTSpawnConfig,
+    checkpoint: int | None = None,
     timeout: int = FUNCTION_TIMEOUT_INFERENCE,
     q=None,
 ):
@@ -236,7 +236,7 @@ async def serve(
     from huggingface_hub import snapshot_download  # type: ignore
     from pydantic import BaseModel
 
-    from lerobot.common.policies.act.modeling_act import ACTPolicy
+    from lerobot.policies.act.modeling_act import ACTPolicy
     from supabase import Client, create_client
 
     class RetryError(Exception):
@@ -256,33 +256,83 @@ async def serve(
 
     server_port = 80
 
-    with modal.forward(server_port, unencrypted=True) as tunnel:
-        model_path = find_model_path(model_id=model_id)
-
-        if model_path is None:
-            logger.warning(
-                f"🤗 Model {model_id} not found in Modal volume. Will be downloaded from HuggingFace."
-            )
-            try:
-                current_timestamp = str(datetime.now(timezone.utc).timestamp())
-                model_path = snapshot_download(
-                    repo_id=model_id,
-                    repo_type="model",
-                    revision="main",
-                    local_dir=f"/data/{model_id}/{current_timestamp}/checkpoints/last/pretrained_model",
-                    token=os.getenv("HF_TOKEN"),
-                )
-                logger.success(f"Model {model_id} downloaded to {model_path}")
-            except Exception as e:
-                logger.error(f"Failed to download model {model_id}: {e}")
-                raise e
+    def _update_server_status(
+        supabase_client: Client,
+        server_id: int,
+        status: str,
+    ):
+        logger.info(f"Updating server status to {status} for server_id {server_id}")
+        if status == "failed":
+            server_payload = {
+                "status": status,
+                "terminated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            supabase_client.table("servers").update(server_payload).eq(
+                "id", server_id
+            ).execute()
+            # Update also the AI control session
+            ai_control_payload = {
+                "status": "stopped",
+                "ended_at": datetime.now(timezone.utc).isoformat(),
+            }
+            supabase_client.table("ai_control_sessions").update(ai_control_payload).eq(
+                "server_id", server_id
+            ).execute()
+        elif status == "stopped":
+            server_payload = {
+                "status": status,
+                "terminated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            supabase_client.table("servers").update(server_payload).eq(
+                "id", server_id
+            ).execute()
+            # Update also the AI control session
+            ai_control_payload = {
+                "status": "stopped",
+                "ended_at": datetime.now(timezone.utc).isoformat(),
+            }
+            supabase_client.table("ai_control_sessions").update(ai_control_payload).eq(
+                "server_id", server_id
+            ).execute()
         else:
-            logger.info(
-                f"🤗 Model {model_id} found in Modal volume. Will be used for inference."
+            raise NotImplementedError(
+                f"Status '{status}' not implemented for server update"
+            )
+
+    with modal.forward(server_port, unencrypted=True) as tunnel:
+        try:
+            local_model_path = snapshot_download(
+                repo_id=model_id,
+                repo_type="model",
+                revision=str(checkpoint) if checkpoint is not None else None,
+                cache_dir="/data/hf_cache",
+            )
+        except RepositoryNotFoundError as e:
+            logger.error(f"Failed to download model {model_id}: {e}")
+            _update_server_status(supabase_client, server_id, "failed")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Model {model_id} not found. Make sure the model is public. Error: {e}",
+            )
+        except RevisionNotFoundError as e:
+            logger.error(
+                f"Failed to download model {model_id} at revision {checkpoint}: {e}"
+            )
+            _update_server_status(supabase_client, server_id, "failed")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Model {model_id} at revision {checkpoint} not found. Error: {e}",
+            )
+        except Exception as e:
+            logger.error(f"Failed to download model {model_id}: {e}")
+            _update_server_status(supabase_client, server_id, "failed")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to download model {model_id}. Error: {e}",
             )
 
         try:
-            policy = ACTPolicy.from_pretrained(model_path).to(device="cuda")
+            policy = ACTPolicy.from_pretrained(local_model_path).to(device="cuda")
             assert isinstance(policy, nn.Module)
             logger.info("Policy loaded successfully")
             policy.eval()
@@ -545,8 +595,10 @@ async def serve(
                 logger.info(
                     "Timeout reached for Inference FastAPI server. Shutting down."
                 )
+                _update_server_status(supabase_client, server_id, "stopped")
             except Exception as e:
                 logger.error(f"Server error: {e}")
+                _update_server_status(supabase_client, server_id, "failed")
                 raise HTTPException(
                     status_code=500,
                     detail=f"Server error: {e}",
@@ -554,60 +606,26 @@ async def serve(
             finally:
                 logger.info("Shutting down FastAPI server")
                 await inference_fastapi_server.shutdown()
+
+        except HTTPException as e:
+            logger.error(f"HTTPException during server setup: {e.detail}")
+            _update_server_status(supabase_client, server_id, "failed")
+            raise e
+
         except Exception as e:
             logger.error(f"Error during server setup: {e}")
-            # Update the server status in the database
-            try:
-                update_date = {
-                    "status": "failed",
-                    "terminated_at": datetime.now(timezone.utc).isoformat(),
-                }
-                supabase_client.table("servers").update(update_date).eq(
-                    "id", server_id
-                ).execute()
-                logger.info(f"Updated server info in database: {update_date}")
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Server setup failed: {e}",
-                )
-            except Exception as e:
-                logger.error(f"Failed to update server info in database: {e}")
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Server setup failed: {e}",
-                )
-        finally:
-            try:
-                # Update the server status in the database
-                update_date_servers = {
-                    "status": "stopped",
-                    "terminated_at": datetime.now(timezone.utc).isoformat(),
-                }
-                supabase_client.table("servers").update(update_date_servers).eq(
-                    "id", server_id
-                ).execute()
-                logger.info(f"Updated server info in database: {update_date_servers}")
-
-                # Update the ai_control_servers table
-                update_date_ai_control = {
-                    "status": "stopped",
-                    "ended_at": datetime.now(timezone.utc).isoformat(),
-                }
-                supabase_client.table("ai_control_sessions").update(
-                    update_date_ai_control
-                ).eq("server_id", server_id).execute()
-                logger.info(
-                    f"Updated ai_control_servers info in database: {update_date_ai_control}"
-                )
-            except Exception as e:
-                logger.error(f"Failed to update server info in database: {e}")
+            _update_server_status(supabase_client, server_id, "failed")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Error during server setup: {e}",
+            )
 
 
 @app.function(
     image=FUNCTION_IMAGE,
     gpu=FUNCTION_GPU_TRAINING,
-    # 10 minutes added for the rest of the code to execute
-    timeout=FUNCTION_TIMEOUT_TRAINING + 10 * MINUTES,
+    # 20 minutes added for the rest of the code to execute
+    timeout=FUNCTION_TIMEOUT_TRAINING + 20 * MINUTES,
     secrets=[
         modal.Secret.from_dict({"MODAL_LOGLEVEL": "DEBUG"}),
         modal.Secret.from_name("supabase"),
@@ -622,24 +640,34 @@ def train(  # All these args should be verified in phosphobot
     wandb_api_key: str | None,
     model_name: str,
     training_params: TrainingParamsAct | TrainingParamsActWithBbox,
+    user_hf_token: str | None = None,
+    private_mode: bool = False,
     max_hf_download_retries: int = 3,
     timeout_seconds: int = FUNCTION_TIMEOUT_TRAINING,
+    wandb_run_id: str = "wandb_run_id_not_set",
     **kwargs,
 ):
     from datetime import datetime, timezone
 
     from supabase import Client, create_client
 
+    from .helper import InvalidInputError, NotEnoughBBoxesError
+
     SUPABASE_URL = os.environ["SUPABASE_URL"]
     SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
     supabase_client: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-    hf_token = os.getenv("HF_TOKEN")
+    # Use user's HF token for private training, fallback to system token
+    hf_token = user_hf_token or os.getenv("HF_TOKEN")
 
     if hf_token is None:
-        raise ValueError("HF_TOKEN environment variable is not set")
+        raise ValueError(
+            "HF_TOKEN is not available (neither user token nor system token)"
+        )
 
-    logger.info(f"🚀 Training {dataset_name} with id {training_id}")
+    logger.info(
+        f"🚀 Training {dataset_name} with id {training_id} and uploading to: {model_name} (private_mode={private_mode})"
+    )
 
     try:
         current_timestamp = str(datetime.now(timezone.utc).timestamp())
@@ -650,7 +678,7 @@ def train(  # All these args should be verified in phosphobot
 
         logger.debug("Creating the HF repo...")
         if not HuggingFaceTokenValidator().has_write_access(
-            hf_token=hf_token, hf_model_name=model_name
+            hf_token=hf_token, hf_model_name=model_name, private=private_mode
         ):
             raise ValueError(
                 f"The provided HF token does not have write access to {dataset_name}"
@@ -705,30 +733,52 @@ def train(  # All these args should be verified in phosphobot
                 image_keys_to_keep=training_params.image_keys_to_keep,
             )
             logger.success(f"Bounding boxes computed and saved to {dataset_path}")
-            dataset_name = "phospho-app/" + dataset_path.name
+
+            # Use user's namespace for private training, phospho-app for public
+            if private_mode and user_hf_token:
+                # Get username from HF token for private training
+                hf_api_temp = HfApi(token=hf_token)
+                try:
+                    user_info = hf_api_temp.whoami()
+                    username = user_info.get("name")
+                    if username:
+                        dataset_name = f"{username}/{dataset_path.name}"
+                    else:
+                        logger.warning(
+                            "Could not get username from HF token, using phospho-app namespace"
+                        )
+                        dataset_name = "phospho-app/" + dataset_path.name
+                except Exception as e:
+                    logger.warning(
+                        f"Error getting username from HF token: {e}, using phospho-app namespace"
+                    )
+                    dataset_name = "phospho-app/" + dataset_path.name
+            else:
+                dataset_name = "phospho-app/" + dataset_path.name
 
             logger.info(f"Uploading dataset {dataset_name} to Hugging Face")
-            api = HfApi(token=hf_token)
-            api.create_repo(
+            hf_api = HfApi(token=hf_token)
+            hf_api.create_repo(
                 repo_type="dataset",
                 repo_id=dataset_name,
                 token=hf_token,
                 exist_ok=True,
+                private=private_mode,
             )
-            api.upload_folder(
+            hf_api.upload_folder(
                 repo_type="dataset",
                 folder_path=str(dataset_path),
                 repo_id=dataset_name,
                 token=hf_token,
             )
-            api.create_branch(
+            hf_api.create_branch(
                 repo_id=dataset_name,
                 repo_type="dataset",
                 branch="v2.0",
-                token=True,
+                token=hf_token,
                 exist_ok=True,
             )
-            api.upload_folder(
+            hf_api.upload_folder(
                 repo_type="dataset",
                 folder_path=str(dataset_path),
                 repo_id=dataset_name,
@@ -751,13 +801,13 @@ def train(  # All these args should be verified in phosphobot
 
         else:
             # Normal ACT: Resize the dataset to 320x240 otherwise there are too many Cuda OOM errors
-            resized_successful, need_to_compute_stats = resize_dataset(
+            resized_successful, need_to_compute_stats, resize_details = resize_dataset(
                 dataset_root_path=dataset_path,
                 resize_to=(320, 240),
             )
             if not resized_successful:
                 raise RuntimeError(
-                    f"Failed to resize dataset {dataset_name} to 320x240, is the dataset in the right format ?"
+                    f"Failed to resize dataset {dataset_name} to 320x240, is the dataset in the right format? Details: {resize_details}"
                 )
             logger.info(
                 f"Resized dataset {dataset_name} to 320x240, need to recompute stats: {need_to_compute_stats}"
@@ -770,7 +820,6 @@ def train(  # All these args should be verified in phosphobot
                     compute_stats(
                         dataset_path,
                         num_workers=int(FUNCTION_CPU_TRAINING),
-                        batch_size=1024,
                     )
                 )
                 STATS_FILE = dataset_path / "meta" / "stats.json"
@@ -807,6 +856,7 @@ def train(  # All these args should be verified in phosphobot
                     output_dir=str(output_dir),
                     wandb_enabled=wandb_enabled,
                     timeout_seconds=timeout_seconds,
+                    wandb_run_id=wandb_run_id,
                 )
             )
         except TimeoutError as te:
@@ -819,14 +869,58 @@ def train(  # All these args should be verified in phosphobot
             raise te
 
         # We now upload the trained model to the HF repo
-        api = HfApi(token=hf_token)
+        hf_api = HfApi(token=hf_token)
+
+        # Create the model repository if it doesn't exist
+        try:
+            hf_api.repo_info(repo_id=model_name, repo_type="model")
+            logger.info(f"Model repository {model_name} already exists.")
+        except Exception:
+            logger.info(f"Creating model repository {model_name}")
+            hf_api.create_repo(
+                repo_id=model_name,
+                repo_type="model",
+                exist_ok=True,
+                private=private_mode,
+                token=hf_token,
+            )
+
         files_directory = output_dir / "checkpoints" / "last" / "pretrained_model"
         output_paths: list[Path] = []
         for item in files_directory.glob("**/*"):
             if item.is_file():
                 logger.debug(f"Uploading {item}")
-                api.upload_file(
+                hf_api.upload_file(
                     repo_type="model",
+                    path_or_fileobj=str(item.resolve()),
+                    path_in_repo=item.name,
+                    repo_id=model_name,
+                    token=hf_token,
+                )
+                output_paths.append(item)
+
+        # Upload other checkpoints as well
+        for item in output_dir.glob("checkpoints/*/pretrained_model/*"):
+            if item.is_file():
+                # Will upload all checkpoints under the name checkpoint-{number}/
+                rel_path = item.relative_to(output_dir)
+                number = rel_path.parts[1]
+                if number == "last":
+                    continue
+                checkpoint_number = int(rel_path.parts[1])
+
+                # Create revision if it doesn't exist
+                hf_api.create_branch(
+                    repo_id=model_name,
+                    repo_type="model",
+                    branch=str(checkpoint_number),
+                    token=hf_token,
+                    exist_ok=True,
+                )
+
+                hf_api.upload_file(
+                    repo_type="model",
+                    revision=str(checkpoint_number),
                     path_or_fileobj=str(item.resolve()),
                     path_in_repo=item.name,
                     repo_id=model_name,
@@ -839,13 +933,11 @@ def train(  # All these args should be verified in phosphobot
             model_type="act",
             dataset_repo_id=dataset_name,
             folder_path=output_dir,
+            training_params=training_params,
             wandb_run_url=wandb_run_url,
-            steps=training_params.steps,
-            epochs=None,
-            batch_size=training_params.batch_size,
             return_readme_as_bytes=True,
         )
-        api.upload_file(
+        hf_api.upload_file(
             repo_type="model",
             path_or_fileobj=readme,
             path_in_repo="README.md",
@@ -865,14 +957,17 @@ def train(  # All these args should be verified in phosphobot
                 "terminated_at": terminated_at,
             }
         ).eq("id", training_id).execute()
-    except Exception as e:
-        logger.error(f"🚨 Training {training_id} for {dataset_name} failed: {e}")
-        terminated_at = datetime.now(timezone.utc).isoformat()
 
+    except (HFValidationError, NotEnoughBBoxesError, InvalidInputError) as e:
+        logger.warning(
+            f"{type(e).__name__} during training {training_id} for {dataset_name}: {e}"
+        )
+        # Update the training status in Supabase
         supabase_client.table("trainings").update(
             {
                 "status": "failed",
-                "terminated_at": terminated_at,
+                "terminated_at": datetime.now(timezone.utc).isoformat(),
+                "error_message": str(e),
             }
         ).eq("id", training_id).execute()
 
@@ -881,15 +976,39 @@ def train(  # All these args should be verified in phosphobot
             dataset_repo_id=dataset_name,
             folder_path=output_dir,
             wandb_run_url=wandb_run_url,
-            steps=training_params.steps,
-            epochs=None,
-            batch_size=training_params.batch_size,
+            training_params=training_params,
             error_traceback=str(e),
             return_readme_as_bytes=True,
         )
-        api = HfApi(token=hf_token)
+        hf_api = HfApi(token=hf_token)
+        hf_api.upload_file(
+            repo_type="model",
+            path_or_fileobj=readme,
+            path_in_repo="README.md",
+            repo_id=model_name,
+            token=hf_token,
+        )
+    except Exception as e:
+        logger.error(f"🚨 ACT Training {training_id} for {dataset_name} failed: {e}")
 
-        api.upload_file(
+        supabase_client.table("trainings").update(
+            {
+                "status": "failed",
+                "terminated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        ).eq("id", training_id).execute()
+
+        readme = generate_readme(
+            model_type="act",
+            dataset_repo_id=dataset_name,
+            folder_path=output_dir,
+            wandb_run_url=wandb_run_url,
+            training_params=training_params,
+            error_traceback=str(e),
+            return_readme_as_bytes=True,
+        )
+        hf_api = HfApi(token=hf_token)
+        hf_api.upload_file(
             repo_type="model",
             path_or_fileobj=readme,
             path_in_repo="README.md",

@@ -1,9 +1,14 @@
+export type Temperature = {
+  current: number | null;
+  max: number | null;
+};
+
 export type RobotConfigStatus = {
   name: string;
   device_name?: string;
   robot_type: "manipulator" | "mobile" | "other";
+  temperature?: Temperature[];
 };
-
 export type SingleCameraStatus = {
   camera_id: number;
   is_active: boolean;
@@ -13,6 +18,7 @@ export type SingleCameraStatus = {
     | "realsense"
     | "dummy"
     | "dummy_stereo"
+    | "zmq"
     | "unknown";
   width: number;
   height: number;
@@ -46,6 +52,7 @@ export type ServerStatus = {
   ai_running_status: "stopped" | "running" | "paused" | "waiting";
   leader_follower_status: boolean;
   server_ip: string;
+  server_port: number;
 };
 
 export type AdminTokenSettings = {
@@ -69,9 +76,11 @@ export type SupabaseTrainingModel = {
   used_wandb: boolean | null;
   model_type: string;
   training_params: null | Record<string, string | number | null>;
+  session_count: number;
+  success_rate: number | null;
 };
 
-export type TrainingConfig = {
+export type TrainingsList = {
   models: SupabaseTrainingModel[];
 };
 
@@ -97,7 +106,6 @@ export type TrainingParamsGR00T = {
   batch_size?: number;
   learning_rate?: number;
   epochs?: number;
-  train_test_split?: number;
   validation_dataset_name?: string;
 };
 
@@ -117,9 +125,14 @@ export type AdminSettings = {
   video_size: [number, number];
   task_instruction: string;
   cameras_to_record: number[] | null;
+  hf_private_mode: boolean;
 };
 
 export type AIStatusResponse = {
   id?: string;
   status: "waiting" | "running" | "stopped" | "paused";
+};
+
+export type TeleopSettings = {
+  vr_scaling: number;
 };

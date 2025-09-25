@@ -1,18 +1,19 @@
+import asyncio
 import atexit
 import json
-import os
-import asyncio
+import time
 from abc import abstractmethod
-from typing import List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
-from fastapi import HTTPException
 import numpy as np
+from fastapi import HTTPException
 from loguru import logger
-from phosphobot.configs import config as cfg
-from phosphobot.models import BaseRobot, BaseRobotConfig, BaseRobotInfo
-from phosphobot.models.lerobot_dataset import FeatureDetails
-from phosphobot.hardware import get_sim
 from scipy.spatial.transform import Rotation as R  # type: ignore
+
+from phosphobot.configs import config as cfg
+from phosphobot.hardware import get_sim
+from phosphobot.models import BaseRobot, BaseRobotConfig, BaseRobotInfo, Temperature
+from phosphobot.models.lerobot_dataset import FeatureDetails
 from phosphobot.utils import (
     euler_from_quaternion,
     get_resources_path,
@@ -24,15 +25,15 @@ class AxisRobot:
     Used to place the robots in a grid.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         # Create a grid of (x, y, 0) positions with a step of 0.4
-        self.grid = []
+        self.grid: List[List[float]] = []
         for x in np.arange(0, 10, 1):
             for y in np.arange(0, 10, 1):
-                self.grid.append([x, y, 0])
+                self.grid.append([float(x), float(y), 0])
         self.grid_index = 0
 
-    def new_position(self):
+    def new_position(self) -> List[float]:
         if self.grid_index >= len(self.grid):
             self.grid_index = 0
         axis = self.grid[self.grid_index]
@@ -63,14 +64,15 @@ class BaseManipulator(BaseRobot):
     # They are in the same order as the joint links in the URDF file
     SERVO_IDS: List[int]
 
-    CALIBRATION_POSITION: list[float]  # same size as SERVO_IDS
-    SLEEP_POSITION: list[float] | None = None
+    CALIBRATION_POSITION: List[float]  # same size as SERVO_IDS
+    SLEEP_POSITION: Optional[List[float]] = None
+    time_to_sleep: float = 0.7  # seconds to wait after moving to sleep position
     RESOLUTION: int
     # The effector is the gripper
     END_EFFECTOR_LINK_INDEX: int
 
     # calibration config: offsets, signs, pid values
-    config: BaseRobotConfig | None = None
+    config: Optional[BaseRobotConfig] = None
 
     # status variables
     is_connected: bool = False
@@ -87,9 +89,9 @@ class BaseManipulator(BaseRobot):
     calibration_max_steps: int = 3
 
     # (x, y, z) position of the robot in the simulation in meters
-    initial_orientation_rad: np.ndarray | None = None
+    initial_orientation_rad: Optional[np.ndarray] = None
     # (rx, ry, rz) orientation of the robot in the simulation
-    initial_position: np.ndarray | None = None
+    initial_position: Optional[np.ndarray] = None
 
     @abstractmethod
     def enable_torque(self) -> None:
@@ -110,7 +112,7 @@ class BaseManipulator(BaseRobot):
         raise NotImplementedError("The robot enable torque must be implemented.")
 
     @abstractmethod
-    def read_motor_torque(self, servo_id: int) -> float | None:
+    def read_motor_torque(self, servo_id: int) -> Optional[float]:
         """
         Read the torque of a motor
 
@@ -119,7 +121,7 @@ class BaseManipulator(BaseRobot):
         raise NotImplementedError("The robot enable torque must be implemented.")
 
     @abstractmethod
-    def read_motor_voltage(self, servo_id: int) -> float | None:
+    def read_motor_voltage(self, servo_id: int) -> Optional[float]:
         """
         Read the voltage of a motor
 
@@ -127,8 +129,28 @@ class BaseManipulator(BaseRobot):
         """
         raise NotImplementedError("The robot enable torque must be implemented.")
 
+    def read_motor_temperature(self, servo_id: int) -> Optional[Tuple[float, float]]:
+        """
+        Read the temperature of a motor
+        raise: Exception if the routine has not been implemented
+        """
+        raise NotImplementedError(
+            "The robot read motor temperature must be implemented."
+        )
+
+    def write_group_motor_maximum_temperature(
+        self, maximum_temperature_target: List[int]
+    ) -> None:
+        """
+        Write the maximum temperature of all motors of a robot.
+        raise: Exception if the routine has not been implemented
+        """
+        raise NotImplementedError(
+            "The robot write group motor temperature must be implemented."
+        )
+
     @abstractmethod
-    def write_motor_position(self, servo_id: int, units: int, **kwargs) -> None:
+    def write_motor_position(self, servo_id: int, units: int, **kwargs: Any) -> None:
         """
         Move the motor to the specified position.
 
@@ -140,14 +162,14 @@ class BaseManipulator(BaseRobot):
         raise NotImplementedError("The robot write motor position must be implemented.")
 
     @abstractmethod
-    def read_motor_position(self, servo_id: int, **kwargs) -> int | None:
+    def read_motor_position(self, servo_id: int, **kwargs: Any) -> Optional[int]:
         """
         Read the position of the motor. This should return the position in motor units.
         """
         raise NotImplementedError("The robot read motor position must be implemented.")
 
     @abstractmethod
-    def calibrate_motors(self, **kwargs) -> None:
+    def calibrate_motors(self, **kwargs: Any) -> None:
         """
         This is called during the calibration phase of the robot.
         It sets the offset of all motors to self.RESOLUTION/2.
@@ -170,14 +192,15 @@ class BaseManipulator(BaseRobot):
 
     def __init__(
         self,
-        device_name: str | None = None,
-        serial_id: str | None = None,
+        device_name: Optional[str] = None,
+        serial_id: Optional[str] = None,
         only_simulation: bool = False,
         reset_simulation_bool: bool = False,
-        axis: List[float] | None = None,
+        axis: Optional[List[float]] = None,
         add_debug_lines: bool = False,
         show_debug_link_indices: bool = False,
-        **kwargs: Optional[dict[str, str]],
+        enable_self_collision: bool = False,
+        **kwargs: Optional[Dict[str, str]],
     ):
         """
         Args:
@@ -190,14 +213,6 @@ class BaseManipulator(BaseRobot):
 
         if axis is None:
             axis = axis_robot.new_position()
-
-        # When creating a new robot, you should add default values for these
-        # These values depends on the hardware
-        assert self.CALIBRATION_POSITION is not None, (
-            "CALIBRATION_POSITION must be defined in the class"
-        )
-        assert self.RESOLUTION is not None, "RESOLUTION must be defined in the class"
-        assert self.SERVO_IDS is not None, "SERVO_IDS must be defined in the class"
 
         if serial_id is not None:
             self.SERIAL_ID = serial_id
@@ -216,18 +231,32 @@ class BaseManipulator(BaseRobot):
             self.sim.reset()
 
         logger.info(f"Loading URDF file: {self.URDF_FILE_PATH}")
-        if not os.path.exists(self.URDF_FILE_PATH):
-            raise FileNotFoundError(
-                f"URDF file not found: {self.URDF_FILE_PATH}\nCurrent path: {os.getcwd()}"
-            )
         self.p_robot_id, num_joints, actuated_joints = self.sim.load_urdf(
             urdf_path=self.URDF_FILE_PATH,
             axis=axis,
             axis_orientation=self.AXIS_ORIENTATION,
             use_fixed_base=True,
+            enable_self_collision=enable_self_collision,
         )
-
+        self.num_joints = num_joints
         self.actuated_joints = actuated_joints
+
+        # Infer SERVO_IDS and CALIBRATION_POSITION from the actuated joints if not set
+        if not hasattr(self, "SERVO_IDS"):
+            self.SERVO_IDS = list(range(1, len(self.actuated_joints) + 1))
+            logger.warning(
+                f"{self.__class__.__name__}.SERVO_IDS not set, using default: {self.SERVO_IDS}"
+            )
+        if not hasattr(self, "CALIBRATION_POSITION"):
+            self.CALIBRATION_POSITION = [0.0] * len(self.SERVO_IDS)
+            logger.warning(
+                f"{self.__class__.__name__}.CALIBRATION_POSITION not set, using default: {self.CALIBRATION_POSITION}"
+            )
+        if not hasattr(self, "SLEEP_POSITION"):
+            self.SLEEP_POSITION = [0.0] * len(self.SERVO_IDS)
+            logger.warning(
+                f"{self.__class__.__name__}.SLEEP_POSITION not set, using default: {self.SLEEP_POSITION}"
+            )
 
         self.sim.set_joints_states(
             robot_id=self.p_robot_id,
@@ -289,7 +318,7 @@ class BaseManipulator(BaseRobot):
         else:
             self.config = None
 
-    def __del__(self):
+    def __del__(self) -> None:
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
@@ -319,6 +348,7 @@ class BaseManipulator(BaseRobot):
         try:
             with open(json_filename, "r") as f:
                 data = json.load(f)
+            logger.debug(f"Loaded default config from {json_filename}")
             return BaseRobotConfig(**data)
         except FileNotFoundError:
             if raise_if_none:
@@ -359,16 +389,18 @@ class BaseManipulator(BaseRobot):
             logger.warning("None torque value for gripper motor ")
             current_gripper_torque = np.int32(0)
 
-        return current_gripper_torque
+        return np.int32(current_gripper_torque)
 
-    async def move_to_initial_position(self):
+    async def move_to_initial_position(self, open_gripper: bool = False) -> None:
         """
         Move the robot to its initial position.
         """
         self.init_config()
         self.enable_torque()
         zero_position = np.zeros(len(self.actuated_joints))
-        self.set_motors_positions(zero_position, enable_gripper=True)
+        self.set_motors_positions(zero_position, enable_gripper=not open_gripper)
+        if open_gripper:
+            self.write_gripper_command(1.0)
         # Wait for the robot to move to the initial position
         await asyncio.sleep(0.5)
         (
@@ -376,7 +408,7 @@ class BaseManipulator(BaseRobot):
             self.initial_orientation_rad,
         ) = self.forward_kinematics()
 
-    async def move_to_sleep(self):
+    async def move_to_sleep(self) -> None:
         """
         Move the robot to its sleep position and disable torque.
         """
@@ -388,7 +420,7 @@ class BaseManipulator(BaseRobot):
                     )
                 except Exception:
                     pass
-            await asyncio.sleep(0.7)
+            await asyncio.sleep(self.time_to_sleep)
             self.disable_torque()
             await asyncio.sleep(0.1)
 
@@ -556,7 +588,7 @@ class BaseManipulator(BaseRobot):
 
     def forward_kinematics(
         self, sync_robot_pos: bool = False
-    ) -> tuple[np.ndarray, np.ndarray]:
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Compute the forward kinematics of the robot
         Returns cartesian position and orientation in radians
@@ -600,19 +632,35 @@ class BaseManipulator(BaseRobot):
             current_effector_orientation_rad,
         )
 
-    def get_end_effector_state(self):
+    def get_end_effector_state(
+        self, sync: bool = False
+    ) -> Tuple[np.ndarray, np.ndarray, float]:
         """
         Return the position and orientation in radians of the end effector and the gripper opening value.
         The gripper opening value between 0 and 1.
+
+        Args:
+            sync: If True, the simulation will first read the motor positions, synchronize them with the simulated robot,
+                and then return the end effector position. Useful for measurements, however it will take more time to respond.
+
+        Returns:
+            A tuple containing:
+                - effector_position: The position of the end effector in the URDF link frame.
+                - effector_orientation_rad: The orientation of the end effector in radians.
+                - closing_gripper_value: The value of the gripper opening, between 0 and 1.
         """
-        effector_position, effector_orientation_rad = self.forward_kinematics()
+        effector_position, effector_orientation_rad = self.forward_kinematics(
+            sync_robot_pos=sync
+        )
         return effector_position, effector_orientation_rad, self.closing_gripper_value
 
     def read_joints_position(
         self,
-        unit: Literal["rad", "motor_units", "degrees"] = "rad",
+        unit: Literal["rad", "motor_units", "degrees", "other"] = "rad",
         source: Literal["sim", "robot"] = "robot",
         joints_ids: Optional[List[int]] = None,
+        min_value: Optional[float] = None,
+        max_value: Optional[float] = None,
     ) -> np.ndarray:
         """
         Read the current angles q of the joints of the robot.
@@ -622,6 +670,7 @@ class BaseManipulator(BaseRobot):
                 - "rad": radians
                 - "motor_units": motor units (0 -> RESOLUTION)
                 - "degrees": degrees
+                - "other": any other unit, specify a min and max value to scale the output.
             source: The source of the data. Can be "sim" or "robot".
                 - "sim": read from the simulation
                 - "robot": read from the robot if connected. Otherwise, read from the simulation.
@@ -689,6 +738,23 @@ class BaseManipulator(BaseRobot):
             elif source_unit == "rad":
                 # Convert from radians to degrees
                 output_position = np.rad2deg(output_position)  # type: ignore
+        elif unit == "other":
+            if min_value is None or max_value is None:
+                raise ValueError(
+                    "For 'other' unit, min_value and max_value must be provided."
+                )
+            if source_unit == "motor_units":
+                # Convert from motor units to radians
+                output_position_rad = self._units_vec_to_radians(output_position)
+                # Normalize the angles to [min_value, max_value]
+                output_position = min_value + (max_value - min_value) * (
+                    output_position_rad + np.pi
+                ) / (2 * np.pi)  # type: ignore
+
+            elif source_unit == "rad":
+                output_position = min_value + (max_value - min_value) * (
+                    output_position + np.pi
+                ) / (2 * np.pi)  # type: ignore
         else:
             raise ValueError(
                 f"Invalid unit: {unit}. Must be one of ['rad', 'motor_units', 'degrees']"
@@ -726,18 +792,19 @@ class BaseManipulator(BaseRobot):
                         continue
                     # Write goal position
                     self.write_motor_position(servo_id=servo_id, units=q_target[i])
+                    time.sleep(0.01)
 
         # Filter out the gripper_joint_index
         if not enable_gripper:
             joint_indices = [
                 i for i in self.actuated_joints if i != self.GRIPPER_JOINT_INDEX
             ]
-            target_positions = [
-                q_target_rad[i] for i in joint_indices if i != self.GRIPPER_JOINT_INDEX
-            ]
+            target_positions = [q_target_rad[i] for i in joint_indices]
         else:
             joint_indices = self.actuated_joints
             target_positions = q_target_rad.tolist()
+            if len(target_positions) > len(joint_indices):
+                target_positions = target_positions[: len(joint_indices)]
 
         self.sim.set_joints_states(
             robot_id=self.p_robot_id,
@@ -776,8 +843,10 @@ class BaseManipulator(BaseRobot):
     def write_joint_positions(
         self,
         angles: List[float],
-        unit: Literal["rad", "motor_units", "degrees"],
+        unit: Literal["rad", "motor_units", "degrees", "other"],
         joints_ids: Optional[List[int]] = None,
+        min_value: Optional[float] = None,
+        max_value: Optional[float] = None,
     ) -> None:
         """
         Move the robot's joints to the specified angles.
@@ -789,6 +858,15 @@ class BaseManipulator(BaseRobot):
             np_angles_rad = np.deg2rad(np_angles_rad)
         elif unit == "motor_units":
             np_angles_rad = self._units_vec_to_radians(np_angles_rad)
+        elif unit == "other":
+            if min_value is None or max_value is None:
+                raise ValueError(
+                    "For 'other' unit, min_value and max_value must be provided."
+                )
+            # Normalize the angles to [-pi, pi]
+            np_angles_rad = (np_angles_rad - min_value) / (max_value - min_value) * (
+                2 * np.pi
+            ) - np.pi
 
         if joints_ids is None:
             if len(np_angles_rad) == len(self.SERVO_IDS):
@@ -856,10 +934,8 @@ class BaseManipulator(BaseRobot):
     async def move_robot_absolute(
         self,
         target_position: np.ndarray,  # cartesian np.array
-        target_orientation_rad: np.ndarray | None,  # rad np.array
-        interpolate_trajectory: bool = False,
-        steps: int = 10,
-        **kwargs,
+        target_orientation_rad: Optional[np.ndarray],  # rad np.array
+        **kwargs: Dict[str, Any],
     ) -> None:
         """
         Move the robot to the absolute position and orientation.
@@ -914,10 +990,7 @@ class BaseManipulator(BaseRobot):
         )
 
         self.is_moving = True
-        if not interpolate_trajectory:
-            self.set_motors_positions(goal_q_robot_rad)
-        else:
-            raise NotImplementedError("Interpolation not implemented yet")
+        self.set_motors_positions(goal_q_robot_rad)
         self.is_moving = False
 
         # reset gripping status when going to init position
@@ -930,7 +1003,7 @@ class BaseManipulator(BaseRobot):
         self.sim.set_joints_states(
             robot_id=self.p_robot_id,
             joint_indices=self.actuated_joints,
-            target_positions=joints,
+            target_positions=list(joints),
         )
         # Update the simulation
         self.sim.step()
@@ -991,11 +1064,7 @@ class BaseManipulator(BaseRobot):
         self.SLEEP_POSITION = None
         self.config = None
 
-    def control_gripper(
-        self,
-        open_command: float,  # Should be between 0 and 1
-        **kwargs,
-    ) -> None:
+    def control_gripper(self, open_command: float, **kwargs: Any) -> None:
         """
         Open or close the gripper until object is gripped.
         open_command: 0 to close, 1 to open
@@ -1006,9 +1075,11 @@ class BaseManipulator(BaseRobot):
         # )
         # Clamp the command between 0 and 1
         self.update_object_gripping_status()
+
         if not self.is_object_gripped:
             open_command_clipped = np.clip(open_command, 0, 1)
         else:
+            # open_command 0 is closed. We won't close further if the object is already gripped, i.e. we will not send a command < closing_gripper_value
             open_command_clipped = np.clip(open_command, self.closing_gripper_value, 1)
 
         # Only tighten if object is not gripped:
@@ -1016,6 +1087,13 @@ class BaseManipulator(BaseRobot):
             self.write_gripper_command(open_command_clipped)
         self.closing_gripper_value = open_command_clipped
 
+        # Update simulation only if the object has not been gripped:
+        self.move_gripper_in_sim(open=open_command_clipped)
+
+    def move_gripper_in_sim(self, open: float) -> None:
+        """
+        Move the gripper in the simulation.
+        """
         ## Simulation side
         # Since last motor ID might not be equal to the number of motors ( due to some shadowed motors)
         # We extract last motor calibration data for the gripper:
@@ -1028,20 +1106,20 @@ class BaseManipulator(BaseRobot):
         else:
             open_position = self.upper_joint_limits[-1]
 
-        # Update simulation only if the object has not been gripped:
         if not self.is_object_gripped:
             self.sim.set_joints_states(
                 robot_id=self.p_robot_id,
                 joint_indices=[self.GRIPPER_JOINT_INDEX],
                 target_positions=[
-                    close_position
-                    + (open_position - close_position) * open_command_clipped
+                    close_position + (open_position - close_position) * open
                 ],
             )
 
     def get_observation(
-        self, do_forward: bool = False
-    ) -> tuple[np.ndarray, np.ndarray]:
+        self,
+        source: Literal["sim", "robot"],
+        do_forward: bool = False,
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Get the observation of the robot.
 
@@ -1053,50 +1131,25 @@ class BaseManipulator(BaseRobot):
             - joints_position: np.array joints position of the robot
         """
 
-        from phosphobot.endpoints.control import (
-            ai_control_signal,
-            leader_follower_control,
-            vr_control_signal,
-        )
-
-        if (
-            ai_control_signal.is_in_loop()
-            or leader_follower_control.is_in_loop()
-            or vr_control_signal.is_in_loop()
-        ):
-            joints_position = self.read_joints_position(unit="rad", source="sim")
-        else:
-            joints_position = self.read_joints_position(unit="rad", source="robot")
+        joints_position = self.read_joints_position(unit="rad", source=source)
 
         if do_forward:
             effector_position, effector_orientation_euler_rad = (
                 self.forward_kinematics()
             )
-            state = np.concatenate((effector_position, effector_orientation_euler_rad))
+            state = np.concatenate(
+                (
+                    effector_position,
+                    effector_orientation_euler_rad,
+                    [joints_position[-1]],
+                )
+            )
         else:
             # Skip forward kinematics and return nan values
-            state = np.full(6, np.nan)
+            # This is size 7 for [x, y, z, rx, ry, rz, gripper]
+            state = np.full(7, np.nan)
 
         return state, joints_position
-
-    def mimick_simu_to_robot(self):
-        """
-        Update simulation base on leader robot reading of joint position.
-        """
-        joints_position = self.read_joints_position(unit="rad")
-        gripper_command = self.read_gripper_command()
-
-        # Update simulation
-        # this take into account the leader that has less joints
-        logger.debug(f"Moving to position: {joints_position}")
-        self.sim.set_joints_states(
-            robot_id=self.p_robot_id,
-            joint_indices=self.actuated_joints,
-            target_positions=joints_position,
-        )
-        # Update the simulation
-        self.sim.step()
-        self.control_gripper(gripper_command)
 
     def get_info_for_dataset(self) -> BaseRobotInfo:
         """
@@ -1122,7 +1175,7 @@ class BaseManipulator(BaseRobot):
             ),
         )
 
-    def current_voltage(self) -> np.ndarray | None:
+    def current_voltage(self) -> Optional[np.ndarray]:
         """
         Read the current voltage u of the joints of the robot.
 
@@ -1141,6 +1194,38 @@ class BaseManipulator(BaseRobot):
 
         # If the robot is not connected, error raised
         return None
+
+    def current_temperature(self) -> Optional[List[Temperature]]:
+        """
+        Read the current and maximum temperature of the joints of the robot.
+        Returns:
+            A list of Temperature objects, one for each joint, or None if the robot is not connected.
+        """
+        if self.is_connected:
+            temperatures = []
+            for servo_id in self.SERVO_IDS:
+                temps = self.read_motor_temperature(servo_id)
+                if temps is not None:
+                    # temps is a tuple: (current, max)
+                    temperature = Temperature(current=temps[0], max=temps[1])
+                    temperatures.append(temperature)
+                else:
+                    temperature = Temperature(current=None, max=None)
+                    temperatures.append(temperature)
+            return temperatures
+
+        # If the robot is not connected, return None
+        return None
+
+    def set_maximum_temperature(self, maximum_temperature_target: List[int]) -> None:
+        """
+        Set the maximum temperature of all motors of a robot.
+        """
+
+        if self.is_connected:
+            self.write_group_motor_maximum_temperature(
+                maximum_temperature_target=maximum_temperature_target
+            )
 
     def is_powered_on(self) -> bool:
         """
@@ -1189,7 +1274,7 @@ class BaseManipulator(BaseRobot):
 
         return current_torque
 
-    def update_object_gripping_status(self):
+    def update_object_gripping_status(self) -> None:
         """
         Based on the torque value, update the object gripping status.
 
@@ -1208,6 +1293,24 @@ class BaseManipulator(BaseRobot):
         if gripper_torque <= self.config.non_gripping_threshold:
             self.is_object_gripped = False
 
+    def _rad_to_open_command(self, radians: float) -> float:
+        """
+        Convert radians to open command for the gripper.
+        """
+        if self.config is None:
+            raise ValueError(
+                "Robot configuration is not set. Run the calibration first."
+            )
+        open_position = self.config.servos_calibration_position[-1]
+        close_position = self.config.servos_offsets[-1]
+        open_command = (
+            self._radians_to_motor_units(
+                radians=radians, servo_id=self.GRIPPER_JOINT_INDEX
+            )
+            - close_position
+        ) / (open_position - close_position)
+        return np.clip(open_command, 0, 1)
+
 
 class BaseMobileRobot(BaseRobot):
     """
@@ -1218,7 +1321,7 @@ class BaseMobileRobot(BaseRobot):
     def __init__(
         self,
         only_simulation: bool = False,
-    ):
+    ) -> None:
         if not only_simulation:
             # Register the disconnect method to be called on exit
             atexit.register(self.move_to_sleep_sync)

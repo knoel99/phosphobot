@@ -1,13 +1,15 @@
 import os
 import platform
 import uuid
+from functools import wraps
+from pathlib import Path
+from typing import Any, Callable, Optional
 
 from posthog import Posthog
 
 from phosphobot import __version__
-from phosphobot.telemetry import TELEMETRY
+from phosphobot.configs import config
 from phosphobot.utils import get_home_app_path, get_tokens
-
 
 tokens = get_tokens()
 posthog = Posthog(
@@ -20,12 +22,36 @@ posthog_details = {
     "system_info": f"{platform.node()}_{platform.system()}_{platform.release()}",
 }
 
+# Failure tracking
+_failure_count = 0
+_failure_threshold = 3
 
-def is_github_actions():
+
+def with_failure_tracking(func: Callable) -> Callable:
+    @wraps(func)
+    def wrapper(*args: Any, **kwargs: Any) -> None:
+        global _failure_count
+
+        if posthog.disabled:
+            return
+
+        try:
+            result = func(*args, **kwargs)
+            _failure_count = 0  # Reset on success
+            return result
+        except Exception:
+            _failure_count += 1
+            if _failure_count >= _failure_threshold:
+                posthog.disabled = True
+
+    return wrapper
+
+
+def is_github_actions() -> bool:
     return os.getenv("GITHUB_ACTIONS") == "true"
 
 
-def get_or_create_unique_id(token_path):
+def get_or_create_unique_id(token_path: Path) -> str:
     """
     Retrieve or generate a unique ID, storing it in a token file. This is an
     anonymous identifier for the user.
@@ -60,7 +86,7 @@ def get_or_create_unique_id(token_path):
 
 
 # We disable posthog in dev environments
-if not TELEMETRY or is_github_actions():
+if not config.USAGE_TELEMETRY or is_github_actions():
     posthog.disabled = True
 
 session_id = str(uuid.uuid4())
@@ -70,6 +96,7 @@ TOKEN_FILE = get_home_app_path() / "id.token"
 user_id = get_or_create_unique_id(TOKEN_FILE)
 
 
+@with_failure_tracking
 def posthog_pageview(page: str) -> None:
     posthog.capture(
         distinct_id=user_id,
@@ -81,7 +108,7 @@ def posthog_pageview(page: str) -> None:
     )
 
 
-def add_email_to_posthog(email: str | None) -> None:
+def add_email_to_posthog(email: Optional[str]) -> None:
     if posthog.disabled or not email:
         return
 

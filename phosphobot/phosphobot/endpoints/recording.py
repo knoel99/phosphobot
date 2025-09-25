@@ -1,5 +1,6 @@
 import os
 from copy import copy
+from typing import Dict, Literal
 
 from fastapi import (
     APIRouter,
@@ -11,17 +12,18 @@ from loguru import logger
 
 from phosphobot.camera import AllCameras, get_all_cameras
 from phosphobot.configs import config
+from phosphobot.hardware.base import BaseManipulator
 from phosphobot.models import (
     BaseDataset,
     BaseEpisode,
+    InfoModel,
     RecordingPlayRequest,
     RecordingStartRequest,
     RecordingStopRequest,
     RecordingStopResponse,
     StatusResponse,
 )
-from phosphobot.models import InfoModel
-from phosphobot.models.lerobot_dataset import LeRobotDataset
+from phosphobot.models.lerobot_dataset import InfoFeatures, LeRobotDataset
 from phosphobot.posthog import is_github_actions
 from phosphobot.recorder import Recorder, get_recorder
 from phosphobot.robot import RobotConnectionManager, get_rcm
@@ -30,7 +32,6 @@ from phosphobot.utils import background_task_log_exceptions, get_home_app_path
 router = APIRouter(tags=["recording"])
 
 
-# The record_data function is passed as a BackgroundTasks
 @router.post("/recording/start", response_model=StatusResponse)
 async def start_recording_episode(
     query: RecordingStartRequest,
@@ -95,19 +96,42 @@ async def start_recording_episode(
     number_of_connected_cameras = len(cameras_ids_to_record)
 
     # Compute the number of connected robots and remove leader arms
-    number_of_connected_robots = 0
-    robots_to_record = copy(await rcm.robots)
-    for robot in await rcm.robots:
-        if (
-            hasattr(robot, "SERIAL_ID")
-            and query.robot_serials_to_ignore is not None
-            and robot.SERIAL_ID in query.robot_serials_to_ignore
-        ):
-            robots_to_record.remove(robot)
-        else:
-            number_of_connected_robots += 1
+    robots_to_record = 0
+    actions_robots_mapping: Dict[int, Literal["sim", "robot"]] = {}
+    observations_robots_mapping: Dict[int, Literal["sim", "robot"]] = {}
 
-    if len(robots_to_record) == 0:
+    robots = await rcm.robots
+
+    from phosphobot.endpoints.control import (
+        signal_leader_follower,
+    )
+
+    if query.robot_serials_to_ignore is None:
+        query.robot_serials_to_ignore = []
+    if query.leader_arm_ids is None:
+        query.leader_arm_ids = []
+
+    for i, robot in enumerate(robots):
+        if signal_leader_follower.is_in_loop():
+            # Leader-follower mode
+            if getattr(robot, "SERIAL_ID", None) in query.leader_arm_ids:
+                # The leader arm is recorded for the action
+                actions_robots_mapping[i] = "robot"
+                robots_to_record += 1
+            elif getattr(robot, "SERIAL_ID", None) in query.robot_serials_to_ignore:
+                # Ignore robots that are in the ignore list
+                continue
+            else:
+                # The follower arms are recorded for the observation
+                observations_robots_mapping[i] = "robot"
+                robots_to_record += 1
+        elif getattr(robot, "SERIAL_ID", None) not in query.robot_serials_to_ignore:
+            # Not in leader-follower mode: record all robots that are not ignored
+            actions_robots_mapping[i] = "sim"
+            observations_robots_mapping[i] = "robot"
+            robots_to_record += 1
+
+    if robots_to_record == 0:
         raise HTTPException(
             status_code=400,
             detail="No robots to record. You should have at least one robot connected to start recording.",
@@ -121,34 +145,77 @@ async def start_recording_episode(
                 format=format,
             )
             number_of_cameras_in_dataset = len(info_model.features.observation_images)
-
-            # If we are in the github action, we add 2 simulated cameras
+            # If we are in the github action, we add 2 simulated cameras for CICD (testing)
             if is_github_actions() and number_of_connected_cameras == 0:
                 number_of_connected_cameras += 2
-
-            # Our robots are 6 DOF, so we divide the number of actions by 6
-            number_of_robots_in_dataset = info_model.features.action.shape[0] // 6
-
             if number_of_connected_cameras != number_of_cameras_in_dataset:
                 raise KeyError(
                     f"Dataset {dataset_name} has {number_of_cameras_in_dataset} cameras but you have {number_of_connected_cameras} connected. Create a new dataset by changing the dataset name in Admin Settings."
                 )
-            if number_of_connected_robots != number_of_robots_in_dataset:
+
+            if (
+                info_model.features.action_cartesian is None
+                or info_model.features.observation_cartesian_state is None
+            ) and query.save_cartesian:
                 raise KeyError(
-                    f"Dataset {dataset_name} has {number_of_robots_in_dataset} robots but you have {number_of_connected_robots} connected. Create a new dataset by changing the dataset name in Admin Settings."
+                    f"Dataset {dataset_name} does not have cartesian action or observation data but you are requesting to save it. Create a new dataset by changing the dataset name in Admin Settings."
+                )
+            if (
+                info_model.features.action_cartesian is not None
+                and info_model.features.observation_cartesian_state is not None
+            ) and not query.save_cartesian:
+                raise KeyError(
+                    f"Dataset {dataset_name} has cartesian action or observation data but you are requesting not to save it. Create a new dataset by changing the dataset name in Admin Settings."
+                )
+
+            expected_columns = set(InfoFeatures.__annotations__.keys())
+            current_features = set(info_model.features.model_dump().keys())
+            metadata_labels = current_features - expected_columns
+            requested_metadata_labels = (
+                set(query.add_metadata.keys()) if query.add_metadata else set()
+            )
+
+            if metadata_labels != requested_metadata_labels:
+                raise KeyError(
+                    f"Metadata labels {metadata_labels} do not match the passed metadata keys {requested_metadata_labels}."
+                )
+            # Also check the size of metadata fields
+            for label in metadata_labels:
+                request_label_length = (
+                    len(query.add_metadata[label]) if query.add_metadata else 0
+                )
+                info_label_length = getattr(info_model.features, label)["shape"][0]
+                if request_label_length != info_label_length:
+                    raise KeyError(
+                        f"Metadata label {label} has size {info_label_length} in the dataset but size {request_label_length} in the request."
+                    )
+
+            # Get action dimensions from existing dataset
+            dataset_action_dim = info_model.features.action.shape[0]
+            # Calculate expected action dimensions from connected robots
+            expected_action_dim = 0
+            for robot_idx in actions_robots_mapping.keys():
+                assert isinstance(
+                    robots[robot_idx], BaseManipulator
+                ), "Robot must be an instance of BaseManipulator."
+            # We don't do both for loops together as some robots may be in both lists
+            for robot_idx in observations_robots_mapping.keys():
+                assert isinstance(
+                    robots[robot_idx], BaseManipulator
+                ), "Robot must be an instance of BaseManipulator."
+                base_robot_info = robots[robot_idx].get_info_for_dataset()
+                expected_action_dim += base_robot_info.action.shape[0]
+
+            if expected_action_dim != dataset_action_dim:
+                raise KeyError(
+                    f"Dataset {dataset_name} has action dimension {dataset_action_dim} but connected robots have total action dimension {expected_action_dim}. Create a new dataset by changing the dataset name in Admin Settings."
                 )
         except ValueError:
             # This means the dataset does not exist yet
             pass
         except KeyError as e:
             # This means the dataset exists but the number of cameras or robots is not consistent
-            logger.warning(
-                "Number of cameras or robots is not consistent with the existing dataset. Create a new dataset by changing the dataset name in Admin Settings."
-            )
-            raise HTTPException(
-                status_code=400,
-                detail=str(e),
-            )
+            raise HTTPException(status_code=400, detail=str(e))
 
     # Check if the recorder is not currently saving
     if recorder.is_saving:
@@ -166,11 +233,16 @@ async def start_recording_episode(
         codec=query.video_codec or config.DEFAULT_VIDEO_CODEC,
         freq=query.freq or config.DEFAULT_FREQ,
         branch_path=query.branch_path,
-        robots=robots_to_record,  # type: ignore
+        robots=robots,
+        actions_robots_mapping=actions_robots_mapping,
+        observations_robots_mapping=observations_robots_mapping,
         target_size=query.target_video_size
         or (config.DEFAULT_VIDEO_SIZE[0], config.DEFAULT_VIDEO_SIZE[1]),
         cameras_ids_to_record=cameras_ids_to_record,
         instruction=query.instruction or config.DEFAULT_TASK_INSTRUCTION,
+        enable_rerun=query.enable_rerun_visualization,
+        save_cartesian=query.save_cartesian,
+        add_metadata=query.add_metadata,
     )
     return StatusResponse()
 

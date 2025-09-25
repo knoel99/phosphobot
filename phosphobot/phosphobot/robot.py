@@ -15,10 +15,11 @@ from phosphobot.hardware import (
     KochHardware,
     LeKiwi,
     PiperHardware,
+    RemotePhosphobot,
     SO100Hardware,
     UnitreeGo2,
+    URDFLoader,
     WX250SHardware,
-    RemotePhosphobot,
     get_sim,
 )
 from phosphobot.models import RobotConfigStatus
@@ -34,6 +35,7 @@ robot_name_to_class = {
     LeKiwi.name: LeKiwi,
     PiperHardware.name: PiperHardware,
     RemotePhosphobot.name: RemotePhosphobot,
+    URDFLoader.name: URDFLoader,
 }
 
 
@@ -53,7 +55,7 @@ class RobotConnectionManager:
     available_can_ports: List[str]
     last_scan_time: float
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.available_ports = []
         self.available_can_ports = []
         self.last_scan_time = 0
@@ -61,7 +63,7 @@ class RobotConnectionManager:
         self._all_robots = []
         self._manually_added_robots = []
 
-    def __del__(self):
+    def __del__(self) -> None:
         # Disconnect all robots
         for robot in self._all_robots:
             robot.disconnect()
@@ -76,7 +78,7 @@ class RobotConnectionManager:
         if config.ENABLE_CAN:
             # Look for CAN ports
             can_ports = []
-            for i in range(2):  # Adjust based on maximum expected CAN interfaces
+            for i in range(config.MAX_CAN_INTERFACES):
                 can_name = f"can{i}"
                 if is_can_plugged(can_name):
                     can_ports.append(can_name)
@@ -177,7 +179,7 @@ class RobotConnectionManager:
                 logger.debug(f"Robot created: {robot}")
                 await robot.connect()
 
-                if robot is not None:
+                if robot is not None and robot.is_connected:
                     logger.success(f"Connected to {robot_class.name} on {port.device}.")
                     self._all_robots.append(robot)
                     # Mark both device and serial as connected
@@ -187,24 +189,25 @@ class RobotConnectionManager:
                     break  # stop trying other classes on this port
 
         # Detect CAN-based Agilex Piper robots
-        for can_name in self.available_can_ports:
-            logger.info(f"Attempting to connect to Agilex Piper on {can_name}")
-            try:
-                robot = PiperHardware.from_can_port(can_name=can_name)
-                if robot is None:
-                    logger.debug(
-                        f"Failed to create PiperHardware from {can_name}. Skipping."
+        if config.ENABLE_CAN:
+            for can_name in self.available_can_ports:
+                logger.info(f"Attempting to connect to Agilex Piper on {can_name}")
+                try:
+                    robot = PiperHardware.from_can_port(can_name=can_name)
+                    if robot is None:
+                        logger.debug(
+                            f"Failed to create PiperHardware from {can_name}. Skipping."
+                        )
+                        continue
+                    await robot.connect()
+                except Exception as e:
+                    logger.warning(
+                        f"Error connecting to Agilex Piper on {can_name}: {e}. Skipping."
                     )
                     continue
-                await robot.connect()
-            except Exception as e:
-                logger.warning(
-                    f"Error connecting to Agilex Piper on {can_name}: {e}. Skipping."
-                )
-                continue
-            if robot is not None:
-                self._all_robots.append(robot)
-                logger.success(f"Connected to Agilex Piper on {can_name}")
+                if robot is not None and robot.is_connected:
+                    self._all_robots.append(robot)
+                    logger.success(f"Connected to Agilex Piper on {can_name}")
 
         # Add manually added robots
         self._all_robots.extend(self._manually_added_robots)
@@ -291,11 +294,18 @@ class RobotConnectionManager:
         robots_status = [robot.status() for robot in await self.robots]
         return [status for status in robots_status if status is not None]
 
-    async def add_connection(self, robot_name: str, connection_details: dict[str, Any]):
+    async def add_connection(
+        self, robot_name: str, connection_details: dict[str, Any]
+    ) -> tuple[int, BaseRobot]:
         """
         Manually add a connection to a robot using the robot type and connection details.
         Useful when detecting the robot is more complex than just a serial port.
         Eg: IP address, etc.
+
+        :param robot_name: Name of the robot to connect to.
+        :param connection_details: Dictionary containing connection details specific to the robot.
+
+        :return: Tuple containing the robot ID and the connected robot instance.
         """
         robot_class = robot_name_to_class.get(robot_name)
         if robot_class is None:
@@ -310,6 +320,29 @@ class RobotConnectionManager:
         logger.success(
             f"Connected to {robot.name} with robot_id {len(self._all_robots) - 1}."
         )
+        robot_id = len(self._all_robots) - 1
+        return robot_id, robot
+
+    async def remove_connection(self, robot_id: int) -> None:
+        """
+        Remove a connection to a robot by its ID.
+        """
+        if not isinstance(robot_id, int):
+            raise ValueError("robot_id must be an integer.")
+
+        if robot_id < 0 or robot_id >= len(self._all_robots):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Robot ID {robot_id} is out of range. Only {len(self._all_robots)} robots connected.",
+            )
+
+        robot = await self.get_robot(robot_id=robot_id)
+        robot.disconnect()
+        self._all_robots.remove(robot)
+        if robot in self._manually_added_robots:
+            # Remove from manually added robots if it was added manually
+            self._manually_added_robots.remove(robot)
+        logger.success(f"Disconnected and removed robot with ID {robot_id}.")
 
 
 @lru_cache()

@@ -45,14 +45,37 @@ interface GlobalStore {
   setCameraKeysMapping: (mapping: Record<string, number> | null) => void;
   modelId: string;
   setModelId: (modelId: string) => void;
-  selectedModelType: "ACT" | "ACT_BBOX" | "gr00t" | "custom";
+  selectedModelType: "pi0.5" | "ACT" | "ACT_BBOX" | "gr00t" | "custom";
   setSelectedModelType: (
-    modelType: "ACT" | "ACT_BBOX" | "gr00t" | "custom",
+    modelType: "pi0.5" | "ACT" | "ACT_BBOX" | "gr00t" | "custom",
   ) => void;
+  selectedAngleFormat: "degrees" | "radians" | "other";
+  setSelectedAngleFormat: (
+    angleFormat: "degrees" | "radians" | "other",
+  ) => void;
+  minAngle: number;
+  setMinAngle: (minAngle: number) => void;
+  maxAngle: number;
+  setMaxAngle: (maxAngle: number) => void;
   selectedDataset: string;
   setSelectedDataset: (dataset: string) => void;
   selectedCameraId: number;
   setSelectedCameraId: (cameraId: number) => void;
+  urdfPath: string;
+  setUrdfPath: (path: string) => void;
+  urdfPathHistory: string[];
+  addUrdfPathToHistory: (path: string) => void;
+  endEffectorLinkIndex: number;
+  setEndEffectorLinkIndex: (index: number) => void;
+  gripperJointIndex: number;
+  setGripperJointIndex: (index: number) => void;
+  // New fields for ZMQ server configuration
+  zmqServerUrl: string;
+  setZmqServerUrl: (url: string) => void;
+  zmqTopic: string;
+  setZmqTopic: (topic: string) => void;
+  urdfUseZmq: boolean;
+  setUrdfUseZmq: (useZmq: boolean) => void;
 }
 
 const useGlobalStore = create(
@@ -60,7 +83,6 @@ const useGlobalStore = create(
     (set) => ({
       leaderArmSerialIds: [],
       setLeaderArmSerialIds: (ids) => set(() => ({ leaderArmSerialIds: ids })),
-      // add one if not already presentx
       addLeaderArmSerialId: (armId) =>
         set((state) => ({
           leaderArmSerialIds: state.leaderArmSerialIds.includes(armId)
@@ -91,10 +113,25 @@ const useGlobalStore = create(
         })),
       selectedModelType: "ACT_BBOX",
       setSelectedModelType: (
-        modelType: "ACT" | "ACT_BBOX" | "gr00t" | "custom",
+        modelType: "pi0.5" | "ACT" | "ACT_BBOX" | "gr00t" | "custom",
       ) =>
         set(() => ({
           selectedModelType: modelType,
+        })),
+      selectedAngleFormat: "radians",
+      setSelectedAngleFormat: (angleFormat: "degrees" | "radians" | "other") =>
+        set(() => ({
+          selectedAngleFormat: angleFormat,
+        })),
+      minAngle: -3.14,
+      setMinAngle: (minAngle: number) =>
+        set(() => ({
+          minAngle: minAngle,
+        })),
+      maxAngle: 3.14,
+      setMaxAngle: (maxAngle: number) =>
+        set(() => ({
+          maxAngle: maxAngle,
         })),
       selectedDataset: "",
       setSelectedDataset: (dataset: string) =>
@@ -106,6 +143,38 @@ const useGlobalStore = create(
         set(() => ({
           selectedCameraId: cameraId,
         })),
+      urdfPath: "",
+      setUrdfPath: (path: string) =>
+        set(() => ({
+          urdfPath: path,
+        })),
+      urdfPathHistory: [],
+      addUrdfPathToHistory: (path: string) =>
+        set((state) => {
+          const newHistory = [
+            path,
+            ...state.urdfPathHistory.filter((p) => p !== path),
+          ].slice(0, 5);
+          return {
+            urdfPathHistory: newHistory,
+          };
+        }),
+      endEffectorLinkIndex: 0,
+      setEndEffectorLinkIndex: (index: number) =>
+        set(() => ({
+          endEffectorLinkIndex: index,
+        })),
+      gripperJointIndex: 0,
+      setGripperJointIndex: (index: number) =>
+        set(() => ({
+          gripperJointIndex: index,
+        })),
+      zmqServerUrl: "tcp://localhost:5555",
+      setZmqServerUrl: (url: string) => set({ zmqServerUrl: url }),
+      zmqTopic: "observations",
+      setZmqTopic: (topic: string) => set({ zmqTopic: topic }),
+      urdfUseZmq: false,
+      setUrdfUseZmq: (useZmq: boolean) => set({ urdfUseZmq: useZmq }),
     }),
 
     {
@@ -211,4 +280,43 @@ export function useIsMobile() {
   return isMobile;
 }
 
-export { useGlobalStore };
+/**
+ * A custom hook to manage state that is persisted in localStorage.
+ * It syncs the state with localStorage on every change and loads the
+ * initial state from localStorage on mount.
+ *
+ * @param key The key to use in localStorage.
+ * @param defaultValue The default value to use if nothing is in localStorage.
+ * @returns A state and a setter function, like React.useState.
+ */
+function useLocalStorageState<T>(
+  key: string,
+  defaultValue: T,
+): [T, (value: T) => void] {
+  const [value, setValue] = useState<T>(() => {
+    // Check if running on the client side
+    if (typeof window === "undefined") {
+      return defaultValue;
+    }
+    try {
+      const item = window.localStorage.getItem(key);
+      return item ? JSON.parse(item) : defaultValue;
+    } catch (error) {
+      console.error("Error reading from localStorage", error);
+      return defaultValue;
+    }
+  });
+
+  useEffect(() => {
+    // This effect runs only on the client side
+    try {
+      window.localStorage.setItem(key, JSON.stringify(value));
+    } catch (error) {
+      console.error("Error writing to localStorage", error);
+    }
+  }, [key, value]);
+
+  return [value, setValue];
+}
+
+export { useGlobalStore, useLocalStorageState };

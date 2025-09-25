@@ -15,10 +15,9 @@ import traceback
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Any, Literal, Tuple, Union
+from typing import Annotated, Any, Callable, Dict, Literal, Optional, Tuple, Union
 
 import av
-import cv2
 import netifaces
 import numpy as np
 import pandas as pd
@@ -28,7 +27,6 @@ from fastapi import HTTPException
 from huggingface_hub import HfApi, login
 from loguru import logger
 from pydantic import BaseModel, BeforeValidator, PlainSerializer
-
 
 from phosphobot.types import VideoCodecs
 
@@ -79,13 +77,13 @@ def get_quaternion_from_euler(euler_angles: np.ndarray, degrees: bool) -> np.nda
 
 
 def print_numpy_array(
-    arr,
-    precision=2,
-    max_line_width=100,
-    suppress_small=True,
-    show_shape=True,
-    show_dtype=True,
-):
+    arr: np.ndarray,
+    precision: int = 2,
+    max_line_width: int = 100,
+    suppress_small: bool = True,
+    show_shape: bool = True,
+    show_dtype: bool = True,
+) -> None:
     """
     Customizable pretty-printer for NumPy arrays.
 
@@ -128,7 +126,9 @@ def print_numpy_array(
     np.set_printoptions()
 
 
-def cartesian_to_polar(x, y, z):
+def cartesian_to_polar(
+    x: np.ndarray, y: np.ndarray, z: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Convert cartesian coordinates to polar coordinates
     """
@@ -139,7 +139,9 @@ def cartesian_to_polar(x, y, z):
     return r, theta, z
 
 
-def polar_to_cartesian(r, theta, z):
+def polar_to_cartesian(
+    r: np.ndarray, theta: np.ndarray, z: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Convert polar coordinates to cartesian coordinates
     """
@@ -226,7 +228,7 @@ def login_to_hf(revalidate: bool = True) -> bool:
         return False
 
 
-def zip_folder(folder_path, zip_path):
+def zip_folder(folder_path: str, zip_path: str) -> None:
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
         for root, dirs, files in os.walk(folder_path):
             for file in files:
@@ -333,19 +335,27 @@ def fetch_latest_brew_version(fail_silently: bool = False) -> str:
 @dataclass
 class Tokens:
     ENV: Literal["dev", "prod"] = "dev"
-    SENTRY_DSN: str | None = None
+    SENTRY_DSN: Optional[str] = None
     # This is used to track the app usage
-    POSTHOG_API_KEY: str | None = "phc_EesFKS4CVoyc0URzJN0FOETpg7KipCBEpRvHEvv5mDF"
-    POSTHOG_HOST: str | None = "https://us.i.posthog.com"
-    SUPABASE_URL: str | None = None
-    SUPABASE_KEY: str | None = None
-    MODAL_API_URL: str | None = None
+    POSTHOG_API_KEY: Optional[str] = "phc_EesFKS4CVoyc0URzJN0FOETpg7KipCBEpRvHEvv5mDF"
+    POSTHOG_HOST: Optional[str] = "https://us.i.posthog.com"
+    SUPABASE_URL: Optional[str] = None
+    SUPABASE_KEY: Optional[str] = None
+    MODAL_API_URL: Optional[str] = None
 
 
 def get_tokens() -> Tokens:
     """
     Load the tokens.toml file
     """
+    # Try to load dev tokens first
+    tokens_toml_path = get_resources_path() / "tokens.dev.toml"
+    if tokens_toml_path.exists():
+        # Load with toml
+        tokens = toml.load(tokens_toml_path)
+        logger.debug("Loaded dev tokens")
+        return Tokens(**tokens)
+    # If not found, try to load prod tokens
     tokens_toml_path = get_resources_path() / "tokens.toml"
     if not tokens_toml_path.exists():
         return Tokens()
@@ -357,7 +367,7 @@ def get_tokens() -> Tokens:
 class NumpyEncoder(json.JSONEncoder):
     """Custom encoder for numpy data types"""
 
-    def default(self, obj):
+    def default(self, obj: object) -> Any:
         logger.info(f"Encoding with NumpyEncoder object type({type(obj)}) {obj}")
         if isinstance(obj, np.ndarray):
             logger.debug(f"Encoding NumpyEncoder numpy array of shape {obj.shape}")
@@ -396,7 +406,7 @@ def nd_array_custom_before_validator(x: Any) -> np.ndarray:
         raise ValueError("Invalid type for numpy array")
 
 
-def nd_array_custom_serializer(x: np.ndarray):
+def nd_array_custom_serializer(x: np.ndarray) -> list:
     # custom serialization logic: convert to list
     return x.tolist()
 
@@ -460,12 +470,14 @@ def create_video_file(
     is_stereo = aspect_ratio >= 8 / 3
     logger.info(f"Stereo={is_stereo}, aspect_ratio={aspect_ratio:.2f}")
 
-    def open_container(path: str, size: Tuple[int, int]):
+    def open_container(
+        path: str, size: Tuple[int, int]
+    ) -> Tuple[av.container.output.OutputContainer, av.VideoStream]:  # type: ignore
         os.makedirs(os.path.dirname(path), exist_ok=True)
         container = av.open(path, mode="w")
 
         # pick encoder options based on codec
-        encoder_opts: dict[str, str] = {}
+        encoder_opts: Dict[str, str] = {}
         if codec_av in ("h264", "mpeg4", "hevc"):
             # CRF = quality (lower = better), preset = speed/efficiency trade-off
             encoder_opts = {"crf": "18", "preset": "slow"}
@@ -487,11 +499,11 @@ def create_video_file(
             encoder_opts = {"qscale": "2"}
         # else: leave encoder_opts empty for codecs that don’t support these flags
 
-        stream = container.add_stream(
+        stream: av.VideoStream = container.add_stream(  # type: ignore
             codec_av,
             rate=fps,
             options=encoder_opts or None,  # type: ignore
-        )  # type: ignore
+        )
         # Force a minimum bitrate for mpeg4 to avoid artifacts
         if codec_av == "mpeg4":
             # ~5 Mb/s
@@ -501,7 +513,12 @@ def create_video_file(
         stream.pix_fmt = "yuv420p"  # type: ignore
         return container, stream
 
-    def process_and_encode(frame: np.ndarray, stream, container, size: Tuple[int, int]):
+    def process_and_encode(
+        frame: np.ndarray,
+        stream: av.VideoStream,  # type: ignore
+        container: av.container.output.OutputContainer,
+        size: Tuple[int, int],
+    ) -> None:
         # Convert to uint8 RGB if needed
         if frame.dtype != np.uint8:
             frame = np.clip(frame, 0, 255).astype(np.uint8)
@@ -601,6 +618,8 @@ def compute_sum_squaresum_framecount_from_video(
     Returns a list of np.ndarray corresponding respectively to the sum of RGB values, sum of squares of RGB values and nb_pixel.
     We divide by 255.0 RGB values to normalize the values to the range [0, 1].
     """
+    import cv2
+
     # Open the video file
     cap = cv2.VideoCapture(video_path)
 
@@ -684,7 +703,7 @@ def get_field_min_max(df: pd.DataFrame, field_name: str) -> tuple:
         return (df[field_name].min(), df[field_name].max())
 
 
-def parse_hf_username_or_orgid(user_info: dict) -> str | None:
+def parse_hf_username_or_orgid(user_info: dict) -> Optional[str]:
     """
     Extract the username or organization name from the user info dictionary.
     user_info = api.whoami(token=hf_token)
@@ -728,7 +747,7 @@ def parse_hf_username_or_orgid(user_info: dict) -> str | None:
     return None
 
 
-def get_hf_username_or_orgid() -> str | None:
+def get_hf_username_or_orgid() -> Optional[str]:
     """
     Returns the username or organization name from the Hugging Face token file.
     Returns None if we can't write anywhere.
@@ -757,7 +776,7 @@ def get_hf_username_or_orgid() -> str | None:
         return None
 
 
-def get_hf_token() -> str | None:
+def get_hf_token() -> Optional[str]:
     """
     Returns the hf token from the token file.
     Returns None if there is no token.
@@ -778,14 +797,14 @@ def get_hf_token() -> str | None:
         return None
 
 
-def background_task_log_exceptions(func):
+def background_task_log_exceptions(func: Callable) -> Callable:
     """
     Decorator to log exceptions in background tasks (works for both sync/async functions).
     Otherwise, the exception is silently swallowed.
     """
 
     @functools.wraps(func)
-    async def async_wrapper(*args, **kwargs):
+    async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
         try:
             return await func(*args, **kwargs)
         except Exception as e:
@@ -793,7 +812,7 @@ def background_task_log_exceptions(func):
             raise
 
     @functools.wraps(func)
-    def sync_wrapper(*args, **kwargs):
+    def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
         try:
             return func(*args, **kwargs)
         except Exception as e:
@@ -806,7 +825,7 @@ def background_task_log_exceptions(func):
         return sync_wrapper
 
 
-def get_local_network_ip():
+def get_local_network_ip() -> str:
     # Connect to a public IP to get the IP used by the current network interface
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -817,7 +836,7 @@ def get_local_network_ip():
     return ip
 
 
-def get_local_subnet() -> str | None:
+def get_local_subnet() -> Optional[str]:
     """
     Get the local subnet in CIDR notation.
     Returns:
@@ -995,3 +1014,17 @@ async def scan_network_devices(
         logger.warning(f"Fast scan failed: {e}. Falling back to slow scan...")
         ALLOWED_TO_RUN_SCAPY = False
         return await slow_arp_scan()
+
+
+def get_local_ip() -> str:
+    """
+    Get the local IP address of the server.
+    """
+    try:
+        # Create a temporary socket to get the local IP
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))  # Doesn't actually send data
+            server_ip = s.getsockname()[0]
+    except Exception:
+        server_ip = "localhost"
+    return server_ip

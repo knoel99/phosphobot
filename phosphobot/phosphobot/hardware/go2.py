@@ -1,11 +1,10 @@
 import asyncio
-import json
-from collections import deque
-from dataclasses import dataclass
-from typing import Deque
 import concurrent.futures
 import threading
 import time
+from collections import deque
+from dataclasses import dataclass
+from typing import Any, Coroutine, Deque, Literal, Optional, Tuple
 
 import numpy as np
 from go2_webrtc_driver.constants import RTC_TOPIC, SPORT_CMD
@@ -19,7 +18,7 @@ from phosphobot.models import RobotConfigStatus
 @dataclass
 class MovementCommand:
     position: np.ndarray
-    orientation: np.ndarray | None = None
+    orientation: Optional[np.ndarray] = None
 
 
 class UnitreeGo2(BaseMobileRobot):
@@ -27,7 +26,7 @@ class UnitreeGo2(BaseMobileRobot):
 
     UNITREE_MAC_PREFIXES = ["78:22:88"]
 
-    def __init__(self, ip: str, max_history_len: int = 100, **kwargs):
+    def __init__(self, ip: str, max_history_len: int = 100, **kwargs: Any) -> None:
         """
         Initialize the UnitreeGo2 robot.
 
@@ -36,19 +35,19 @@ class UnitreeGo2(BaseMobileRobot):
             **kwargs: Additional keyword arguments
         """
         self.ip = ip
-        self.conn = None
+        self.conn: Optional[Go2WebRTCConnection] = None
         self.current_position = np.zeros(3)  # [x, y, z]
         self.current_orientation = np.zeros(3)  # [roll, pitch, yaw]
         self._is_connected = False
-        self._connection_loop = None
-        self._connection_thread = None
-        self._loop_thread = None
+        self._connection_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._connection_thread: Optional[threading.Thread] = None
+        self._loop_thread: Optional[threading.Thread] = None
         self._shutdown_event = threading.Event()
         self.is_moving = False
 
         # Status variables about the robot
-        self.lowstate = None
-        self.sportmodstate = None
+        self.lowstate: Optional[dict[str, Any]] = None
+        self.sportmodstate: Optional[dict[str, Any]] = None
         self.last_movement = 0.0
 
         # Track movement instructions
@@ -82,10 +81,10 @@ class UnitreeGo2(BaseMobileRobot):
             raise ValueError("Cannot set is_connected to True without a connection")
         self._is_connected = value
 
-    def _create_event_loop_thread(self):
+    def _create_event_loop_thread(self) -> None:
         """Create a dedicated event loop thread for WebRTC operations."""
 
-        def loop_thread():
+        def loop_thread() -> None:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             self._connection_loop = loop
@@ -123,12 +122,12 @@ class UnitreeGo2(BaseMobileRobot):
         if self._connection_loop is None:
             raise RuntimeError("Failed to create event loop")
 
-    async def _loop_runner(self):
+    async def _loop_runner(self) -> None:
         """Keep the event loop alive until shutdown."""
         while not self._shutdown_event.is_set():
             await asyncio.sleep(0.1)
 
-    def _run_async_safely(self, coro):
+    def _run_async_safely(self, coro: Coroutine) -> Any:
         """
         Helper method to run async code safely in the dedicated event loop.
 
@@ -140,6 +139,7 @@ class UnitreeGo2(BaseMobileRobot):
         """
         if self._connection_loop is None:
             self._create_event_loop_thread()
+        assert self._connection_loop is not None, "Event loop is not initialized"
 
         # Use the dedicated event loop
         future = asyncio.run_coroutine_threadsafe(coro, self._connection_loop)
@@ -152,7 +152,7 @@ class UnitreeGo2(BaseMobileRobot):
             logger.error(f"Async operation failed: {e}")
             raise
 
-    async def connect(self):
+    async def connect(self) -> None:
         """
         Initialize communication with the robot.
 
@@ -187,7 +187,7 @@ class UnitreeGo2(BaseMobileRobot):
             # await asyncio.wait_for(self.conn.connect(), timeout=10.0)
             # await self._ensure_moving_mode()
 
-            def lowstate_callback(message):
+            def lowstate_callback(message: dict[str, Any]) -> None:
                 self.lowstate = message["data"]
 
             # Connect to the lowstate topic to receive battery and sensor data
@@ -195,7 +195,7 @@ class UnitreeGo2(BaseMobileRobot):
                 RTC_TOPIC["LOW_STATE"], lowstate_callback
             )
 
-            def sportmodestatus_callback(message):
+            def sportmodestatus_callback(message: dict[str, Any]) -> None:
                 self.sportmodstate = message["data"]
 
             self.conn.datachannel.pub_sub.subscribe(
@@ -253,7 +253,9 @@ class UnitreeGo2(BaseMobileRobot):
             self.is_connected = False
             self._connection_loop = None
 
-    def get_observation(self) -> tuple[np.ndarray, np.ndarray]:
+    def get_observation(
+        self, source: Literal["sim", "robot"], do_forward: bool = False
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Get the observation of the robot.
 
@@ -270,20 +272,20 @@ class UnitreeGo2(BaseMobileRobot):
         return state, joints_position
 
     def set_motors_positions(
-        self, positions: np.ndarray, enable_gripper: bool = False
+        self, q_target_rad: np.ndarray, enable_gripper: bool = False
     ) -> None:
         """
         Not implemented
         """
         pass
 
-    def get_info_for_dataset(self):
+    def get_info_for_dataset(self) -> dict[str, Any]:
         """
         Not implemented
         """
         raise NotImplementedError
 
-    async def _ensure_moving_mode(self):
+    async def _ensure_moving_mode(self) -> None:
         """
         The go2 has multiple motions modes.
         "mcf" is the mode introduced in the 1.1.7 firmware update that allows the robot to move
@@ -319,7 +321,7 @@ class UnitreeGo2(BaseMobileRobot):
         x: float,
         y: float,
         rz: float,
-    ):
+    ) -> None:
         """
         Move the robot to the specified position and orientation asynchronously.
 
@@ -387,8 +389,8 @@ class UnitreeGo2(BaseMobileRobot):
     async def move_robot_absolute(
         self,
         target_position: np.ndarray,
-        target_orientation_rad: np.ndarray | None,
-        **kwargs,
+        target_orientation_rad: Optional[np.ndarray],
+        **kwargs: Any,
     ) -> None:
         """
         Move the robot to the target position and orientation asynchronously.
@@ -423,8 +425,8 @@ class UnitreeGo2(BaseMobileRobot):
     async def move_robot_relative(
         self,
         target_position: np.ndarray,
-        target_orientation_rad: np.ndarray | None,
-        **kwargs,
+        target_orientation_rad: Optional[np.ndarray],
+        **kwargs: Any,
     ) -> None:
         """
         Move the robot to the target position and orientation asynchronously.
@@ -522,7 +524,7 @@ class UnitreeGo2(BaseMobileRobot):
         """
         self._run_async_safely(self.move_to_sleep())
 
-    def __del__(self):
+    def __del__(self) -> None:
         """Cleanup when object is destroyed."""
         try:
             if hasattr(self, "_is_connected") and self._is_connected:

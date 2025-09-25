@@ -1,21 +1,25 @@
 import asyncio
-from collections import deque
 import time
-from typing import Dict, List, Literal, Optional
+from collections import deque
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional
 
-import cv2
+if TYPE_CHECKING:
+    # We only need BaseManipulator for type checking
+    # This prevents loading pybullet in modal
+    from phosphobot.hardware.base import BaseManipulator
+
 import httpx
 import json_numpy  # type: ignore
 import numpy as np
-from loguru import logger
 from fastapi import HTTPException
 from huggingface_hub import HfApi
-from pydantic import BaseModel, field_validator, model_validator
+from loguru import logger
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from phosphobot.am.base import ActionModel
 from phosphobot.camera import AllCameras
 from phosphobot.control_signal import AIControlSignal
-from phosphobot.hardware.base import BaseManipulator
+from phosphobot.models import ModelConfigurationResponse
 from phosphobot.utils import background_task_log_exceptions, get_hf_token
 
 
@@ -24,7 +28,6 @@ class InputFeature(BaseModel):
     shape: List[int]
 
 
-# Define the InputFeatures model to parse input_features
 class InputFeatures(BaseModel):
     state_key: str
     env_key: Optional[str] = None
@@ -39,7 +42,7 @@ class InputFeatures(BaseModel):
         return self.features[self.state_key].shape[0] // 6
 
     @model_validator(mode="before")
-    def infer_keys(cls, values):
+    def infer_keys(cls, values: Dict[str, Any]) -> Dict[str, Any]:
         """
         Preprocess input to infer state_key and video_keys if input is a flat features dict.
         Runs before field validation.
@@ -65,7 +68,7 @@ class InputFeatures(BaseModel):
         return values
 
     @field_validator("features", mode="before")
-    def validate_features(cls, value):
+    def validate_features(cls, value: Dict[str, Any]) -> Dict[str, InputFeature]:
         """
         Validate and transform the features dictionary into InputFeature instances.
         """
@@ -88,7 +91,7 @@ class InputFeatures(BaseModel):
         return result
 
     @model_validator(mode="after")
-    def validate_keys(self):
+    def validate_keys(self) -> "InputFeatures":
         """
         Validate state_key and video_keys against features after all fields are processed.
         """
@@ -143,6 +146,18 @@ class HuggingFaceModelValidator(BaseModel):
         extra = "allow"
 
 
+class HuggingFaceAugmentedValidator(HuggingFaceModelValidator):
+    """
+    This model extends HuggingFaceModelValidator to include additional fields
+    for augmented models, such as available checkpoints.
+    """
+
+    checkpoints: List[str] = Field(
+        default_factory=list,
+        description="List of available checkpoints for the model.",
+    )
+
+
 class ACTSpawnConfig(BaseModel):
     state_key: str
     state_size: list[int]
@@ -150,7 +165,7 @@ class ACTSpawnConfig(BaseModel):
     env_size: Optional[list[int]] = None
     video_keys: list[str]
     video_size: list[int]
-    hf_model_config: HuggingFaceModelValidator
+    hf_model_config: HuggingFaceAugmentedValidator
 
 
 class RetryError(Exception):
@@ -164,8 +179,8 @@ class ACT(ActionModel):
         self,
         server_url: str = "http://localhost",
         server_port: int = 8080,
-        **kwargs,
-    ):
+        **kwargs: Any,
+    ) -> None:
         super().__init__(server_url, server_port)
         self.async_client = httpx.AsyncClient(
             base_url=server_url + f":{server_port}",
@@ -231,7 +246,7 @@ class ACT(ActionModel):
         return actions
 
     @classmethod
-    def fetch_config(cls, model_id: str) -> HuggingFaceModelValidator:
+    def fetch_config(cls, model_id: str) -> HuggingFaceAugmentedValidator:
         """
         Fetch the model configuration from HuggingFace.
         """
@@ -240,6 +255,11 @@ class ACT(ActionModel):
             model_info = api.model_info(model_id)
             if model_info is None:
                 raise Exception(f"Model {model_id} not found on HuggingFace.")
+            # Fetch the available revisions
+            branches = []
+            refs = api.list_repo_refs(model_id)
+            for branch in refs.branches:
+                branches.append(branch.name)
             config_path = api.hf_hub_download(
                 repo_id=model_id,
                 filename="config.json",
@@ -250,18 +270,25 @@ class ACT(ActionModel):
             hf_model_config = HuggingFaceModelValidator.model_validate_json(
                 config_content
             )
+            hf_augmented_config = HuggingFaceAugmentedValidator(
+                **hf_model_config.model_dump(),
+                checkpoints=branches,
+            )
         except Exception as e:
             raise Exception(f"Error loading model {model_id} from HuggingFace: {e}")
-        return hf_model_config
+        return hf_augmented_config
 
     @classmethod
-    def fetch_and_get_video_keys(cls, model_id: str) -> list[str]:
+    def fetch_and_get_configuration(cls, model_id: str) -> ModelConfigurationResponse:
         """
         Fetch the model configuration from HuggingFace and return the video keys.
         """
         hf_model_config = cls.fetch_config(model_id=model_id)
-        video_keys = hf_model_config.input_features.video_keys
-        return video_keys
+        configuration = ModelConfigurationResponse(
+            video_keys=hf_model_config.input_features.video_keys,
+            checkpoints=hf_model_config.checkpoints,
+        )
+        return configuration
 
     @classmethod
     def fetch_spawn_config(cls, model_id: str) -> ACTSpawnConfig:
@@ -297,8 +324,8 @@ class ACT(ActionModel):
         cls,
         model_id: str,
         all_cameras: AllCameras,
-        robots: list[BaseManipulator],
-        cameras_keys_mapping: Dict[str, int] | None = None,
+        robots: list["BaseManipulator"],
+        cameras_keys_mapping: Optional[Dict[str, int]] = None,
         verify_cameras: bool = True,
     ) -> ACTSpawnConfig:
         """
@@ -364,6 +391,8 @@ class ACT(ActionModel):
     def fetch_frame(
         cls, all_cameras: AllCameras, camera_id: int, resolution: list[int]
     ) -> np.ndarray:
+        import cv2
+
         rgb_frame = all_cameras.get_rgb_frame(
             camera_id=camera_id,
             resize=(resolution[2], resolution[1]),
@@ -390,16 +419,19 @@ class ACT(ActionModel):
     async def control_loop(
         self,
         control_signal: AIControlSignal,
-        robots: list[BaseManipulator],
+        robots: list["BaseManipulator"],
         model_spawn_config: ACTSpawnConfig,
         all_cameras: AllCameras,
         fps: int = 30,
         speed: float = 1.0,
-        cameras_keys_mapping: Dict[str, int] | None = None,
+        cameras_keys_mapping: Optional[Dict[str, int]] = None,
         prompt: Optional[str] = None,
         selected_camera_id: Optional[int] = None,
-        **kwargs,
-    ):
+        angle_format: Literal["degrees", "radians", "other"] = "radians",
+        min_angle: Optional[float] = None,
+        max_angle: Optional[float] = None,
+        **kwargs: Any,
+    ) -> None:
         """
         AI control loop that runs in the background and sends actions to the robot.
         It uses the model to get the actions based on the current state of the robot and the cameras.
@@ -408,13 +440,9 @@ class ACT(ActionModel):
         """
 
         nb_iter = 0
-        # We don't have any information about the unit of the model
-        # So we assume it's in radians, if we receive actions greater than 2pi
-        # we switch to using degrees
-        unit: Literal["rad", "degrees"] = "rad"
         config = model_spawn_config.hf_model_config
 
-        db_state_updated = False
+        signal_marked_as_started = False
         actions_queue: deque = deque([])
 
         while control_signal.is_in_loop():
@@ -504,28 +532,30 @@ class ACT(ActionModel):
                 control_signal.stop()
                 break
 
-            if not db_state_updated:
+            if not signal_marked_as_started:
                 control_signal.set_running()
-                db_state_updated = True
-                # Small delay to let the UI update
-                await asyncio.sleep(1)
-
-            # Early stop
-            if not control_signal.is_in_loop():
-                break
+                signal_marked_as_started = True
 
             for action in actions:
-                if unit == "rad":
-                    if action.max() > 2 * np.pi:
-                        logger.warning("Actions are in degrees. Converting to radians.")
-                        unit = "degrees"
+                # Early stop
+                if not control_signal.is_in_loop():
+                    break
 
                 # Send the new joint position to the robot
                 action_list = action.tolist()
+
+                unit: Literal["rad", "motor_units", "degrees", "other"]
+                if angle_format == "radians":
+                    unit = "rad"
+                else:
+                    unit = angle_format
+
                 for robot_index in range(len(robots)):
                     robots[robot_index].write_joint_positions(
                         angles=action_list[robot_index * 6 : robot_index * 6 + 6],
                         unit=unit,
+                        min_value=min_angle,
+                        max_value=max_angle,
                     )
 
                 # Wait fps time

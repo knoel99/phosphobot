@@ -1,24 +1,31 @@
-import socket
+import asyncio
+import logging
 import platform
-from random import random
+import socket
+import sys
+from asyncio import CancelledError
 from contextlib import asynccontextmanager
+from random import random
+from typing import Any, AsyncGenerator, Callable
 
 import sentry_sdk
 import typer
+import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request, applications
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.docs import get_swagger_ui_html
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from loguru import logger
 from rich import print
 
 from phosphobot import __version__
-from phosphobot.camera import AllCameras, get_all_cameras_no_init, get_all_cameras
+from phosphobot.camera import AllCameras, get_all_cameras, get_all_cameras_no_init
 from phosphobot.configs import config
 from phosphobot.endpoints import (
     auth_router,
     camera_router,
+    chat_router,
     control_router,
     networking_router,
     pages_router,
@@ -32,8 +39,10 @@ from phosphobot.posthog import posthog, posthog_pageview
 from phosphobot.recorder import Recorder, get_recorder
 from phosphobot.robot import RobotConnectionManager, get_rcm
 from phosphobot.teleoperation import get_udp_server
+from phosphobot.types import SimulationMode
 from phosphobot.utils import (
     get_home_app_path,
+    get_local_ip,
     get_resources_path,
     login_to_hf,
 )
@@ -48,28 +57,13 @@ def init_telemetry() -> None:
     init_sentry()
 
 
-def get_local_ip() -> str:
-    """
-    Get the local IP address of the server.
-    """
-    try:
-        # Create a temporary socket to get the local IP
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.connect(("8.8.8.8", 80))  # Doesn't actually send data
-            server_ip = s.getsockname()[0]
-    except Exception:
-        server_ip = "localhost"
-    return server_ip
-
-
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # Initialize telemetry
     init_telemetry()
     udp_server = get_udp_server()
     # Initialize pybullet simulation
     sim = get_sim()
-    sim.init_simulation()
     # Initialize rcm
     rcm = get_rcm()
 
@@ -87,19 +81,19 @@ async def lifespan(app: FastAPI):
         udp_server.stop()
 
         from phosphobot.endpoints.control import (
-            ai_control_signal,
-            gravity_control,
-            leader_follower_control,
+            signal_ai_control,
+            signal_gravity_control,
+            signal_leader_follower,
         )
 
-        if ai_control_signal.is_in_loop():
-            ai_control_signal.stop()
+        if signal_ai_control.is_in_loop():
+            signal_ai_control.stop()
             logger.info("AI control signal stopped")
-        if gravity_control.is_in_loop():
-            gravity_control.stop()
+        if signal_gravity_control.is_in_loop():
+            signal_gravity_control.stop()
             logger.info("Gravity control signal stopped")
-        if leader_follower_control.is_in_loop():
-            leader_follower_control.stop()
+        if signal_leader_follower.is_in_loop():
+            signal_leader_follower.stop()
             logger.info("Leader follower control signal stopped")
 
         cameras = get_all_cameras_no_init()
@@ -145,7 +139,7 @@ app.mount(
 )
 
 
-def swagger_monkey_patch(*args, **kwargs):
+def swagger_monkey_patch(*args: Any, **kwargs: Any) -> HTMLResponse:
     posthog_pageview("/docs")
     return get_swagger_ui_html(
         *args,
@@ -160,7 +154,7 @@ applications.get_swagger_ui_html = swagger_monkey_patch
 
 
 @app.exception_handler(HTTPException)
-async def http_exception_handler(request: Request, exc: HTTPException):
+async def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
     logger.warning(f"HTTPException: {exc.status_code} - {exc.detail}")
     return JSONResponse(
         status_code=exc.status_code,
@@ -178,8 +172,8 @@ async def status(
     Get the status of the server.
     """
     from phosphobot.endpoints.control import (
-        ai_control_signal,
-        leader_follower_control,
+        signal_ai_control,
+        signal_leader_follower,
     )
 
     robots = await rcm.robots
@@ -193,9 +187,10 @@ async def status(
         robot_status=await rcm.status(),
         cameras=cameras.status(),
         is_recording=recorder.is_recording or recorder.is_saving,
-        ai_running_status=ai_control_signal.status,
+        ai_running_status=signal_ai_control.status,
+        leader_follower_status=signal_leader_follower.is_in_loop(),
         server_ip=get_local_ip(),
-        leader_follower_status=leader_follower_control.is_in_loop(),
+        server_port=config.PORT,
     )
     return server_status
 
@@ -208,6 +203,7 @@ app.include_router(pages_router)
 app.include_router(networking_router)
 app.include_router(update_router)
 app.include_router(auth_router)
+app.include_router(chat_router)
 
 # TODO : Only allow secured origins
 app.add_middleware(
@@ -221,12 +217,16 @@ app.add_middleware(
 
 # Add the posthog middleware
 @app.middleware("http")
-def posthog_middleware(request: Request, call_next):
+def posthog_middleware(request: Request, call_next: Callable) -> JSONResponse:
     # ignore the /move/relative, /move/absolute and /status endpoints
     if request.url.path not in [
         "/move/relative",
         "/move/absolute",
         "/status",
+        "/joints/read",
+        "/joints/write",
+        "/torque/read",
+        "/update/version",
     ] and not request.url.path.startswith("/asset"):
         # Sample only 20% of the requests
         if random() < 0.2:
@@ -234,7 +234,7 @@ def posthog_middleware(request: Request, call_next):
     return call_next(request)
 
 
-def version_callback(value: bool):
+def version_callback(value: bool) -> None:
     if value:
         print(f"phosphobot {__version__}")
         raise typer.Exit()
@@ -259,7 +259,7 @@ if config.PROFILE:
     from pyinstrument.renderers.speedscope import SpeedscopeRenderer
 
     @app.middleware("http")
-    async def profile_request(request: Request, call_next):
+    async def profile_request(request: Request, call_next: Callable) -> JSONResponse:
         # we map a profile type to a file extension, as well as a pyinstrument profile renderer
         profile_type_to_ext = {"html": "html", "speedscope": "speedscope.json"}
         profile_type_to_renderer = {
@@ -279,3 +279,150 @@ if config.PROFILE:
         with open(filepath, "w") as out:
             out.write(profiler.output(renderer=renderer))
         return response
+
+
+def start_server(
+    host: str = "0.0.0.0",
+    port: int = 80,
+    reload: bool = False,
+    simulation: SimulationMode = SimulationMode.headless,
+    only_simulation: bool = False,
+    simulate_cameras: bool = False,
+    realsense: bool = True,
+    can: bool = True,
+    cameras: bool = True,
+    max_opencv_index: int = 10,
+    max_can_interfaces: int = 4,
+    profile: bool = False,
+    crash_telemetry: bool = True,
+    usage_telemetry: bool = True,
+    telemetry: bool = True,
+    silent: bool = False,
+) -> None:
+    """
+    Start the FastAPI server.
+    """
+
+    log_dir = get_home_app_path()
+    log_file_path = log_dir / "logs.txt"
+
+    if silent:
+        # Only log errors in silent mode
+        logger.remove()
+        logger.add(
+            sys.stderr,
+            level="ERROR",
+            format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} - {message}",
+        )
+
+    # Configure loguru to write logs to a file.
+    # This one sink will capture all logs, including those from uvicorn.
+    logger.add(
+        log_file_path,
+        level="DEBUG",  # Set to DEBUG to capture all details
+        format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} - {message}",
+        rotation="2 MB",
+        retention="7 days",
+        enqueue=True,  # Makes logging thread-safe/process-safe
+        backtrace=True,
+        diagnose=True,
+    )
+
+    # Intercept stdlib logging and forward to loguru.
+    # If not doing that, then tracebacks are not logged to the file.
+    class InterceptHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            # Translate logging level name to loguru level (fallback to levelno)
+            try:
+                level = logger.level(record.levelname).name
+            except Exception:
+                level = record.levelno  # type: ignore
+
+            # Find depth so loguru shows the original caller
+            frame, depth = logging.currentframe(), 2
+            while frame and frame.f_code.co_filename == logging.__file__:
+                if frame.f_back is None:
+                    break
+                frame = frame.f_back
+                depth += 1
+
+            logger.opt(depth=depth, exception=record.exc_info).log(
+                level, record.getMessage()
+            )
+
+    # Replace handlers for the root logger (and be safe: set level to lowest so all messages are forwarded)
+    logging.root.handlers = [InterceptHandler()]
+
+    logger.info("Loguru file logging is configured. Server starting...")
+
+    config.SIM_MODE = simulation
+    config.ONLY_SIMULATION = only_simulation
+    config.SIMULATE_CAMERAS = simulate_cameras
+    config.ENABLE_REALSENSE = realsense
+    config.ENABLE_CAMERAS = cameras
+    config.PORT = port
+    config.PROFILE = profile
+    config.CRASH_TELEMETRY = crash_telemetry  # Enable crash telemetry by default
+    config.USAGE_TELEMETRY = usage_telemetry  # Enable usage telemetry by default
+    config.ENABLE_CAN = can
+    config.MAX_OPENCV_INDEX = max_opencv_index
+    config.MAX_CAN_INTERFACES = max_can_interfaces
+
+    if not telemetry:
+        config.CRASH_TELEMETRY = False
+        config.USAGE_TELEMETRY = False
+
+    # Start the FastAPI app using uvicorn with port retry logic
+    ports = [port]
+    if port == 80:
+        ports += list(range(8020, 8040))  # 8020-8039 inclusive
+
+    success = False
+    for current_port in ports:
+        if is_port_in_use(current_port, host):
+            logger.warning(f"Port {current_port} is unavailable. Trying next...")
+            continue
+
+        try:
+            # Update config with current port
+            config.PORT = current_port
+
+            server_config = uvicorn.Config(
+                "phosphobot.app:app",
+                host=host,
+                port=current_port,
+                reload=reload,
+                timeout_graceful_shutdown=1,
+                log_config=None if silent else uvicorn.config.LOGGING_CONFIG,
+            )
+            server = uvicorn.Server(config=server_config)
+
+            # Run the server within the existing event loop
+            asyncio.run(server.serve())
+            success = True
+            break
+        except OSError as e:
+            if "address already in use" in str(e).lower():
+                logger.warning(f"Port conflict on {current_port}: {e}")
+                continue
+            logger.error(f"Critical server error: {e}")
+            raise typer.Exit(code=1)
+        except KeyboardInterrupt:
+            logger.debug("Server stopped by user.")
+            raise typer.Exit(code=0)
+        except CancelledError:
+            logger.debug("Server shutdown gracefully.")
+            raise typer.Exit(code=0)
+
+    if not success:
+        logger.warning(
+            "All ports failed. Try a custom port with:\n"
+            "phosphobot run --port 8000\n\n"
+            "Check used ports with:\n"
+            "sudo lsof -i :80 # Replace 80 with your port"
+        )
+        raise typer.Exit(code=1)
+
+
+if __name__ == "__main__":
+    typer.run(start_server)
